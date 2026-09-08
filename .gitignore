@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+# Local MLflow store: the sqlite backend and its artifact tree. Both are local
+# machine state that rewrites on every run, and the sqlite file is a binary that
+# diffs badly. A run is reproducible from config/ + prompts/ + the serve script,
+# which are all tracked.
+mlruns/
+mlflow.db
+mlflow.db-journal
+# Per-request JSONL from each sweep. Logged to MLflow as artifacts already.
+results/
+# Quantized checkpoints, rebuilt by quantization-cpu/quantize_qwen3_fp8.py.
+models/

@@ -1,0 +1,297 @@
+# Runbook
+
+Steps to run on the GPU server, in order. Each block is copy-pasteable and says
+what to paste back. Everything above the line marked "GPU server" has already
+been run and verified on the workstation.
+
+## Verified locally (no action needed)
+
+```bash
+uv sync --extra mock --extra dev
+uv run pytest -q                    # 45 passed
+uv run python -m bench.build_prompts # 512/512 prompts land on their exact budget
+```
+
+Smoke test of the whole sweep against the mock vLLM, which is how the client,
+the percentile math, the acceptance-rate differencing and the MLflow structure
+were checked without a GPU:
+
+```bash
+MOCK_TTFT_MS=15 MOCK_ITL_MS=1 uv run uvicorn --app-dir tests mock_server:app --port 8111 &
+uv run python -m bench.run --config-id baseline_bf16 --server-url http://127.0.0.1:8111 \
+    --requests-per-cell 24 --concurrency 1,8
+```
+
+---
+
+# GPU server
+
+## Step 0: record the hardware
+
+```bash
+nvidia-smi --query-gpu=name,memory.total,compute_cap,driver_version --format=csv
+python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
+free -g | head -2
+```
+
+**Paste back all three outputs.** `compute_cap` decides whether FP8 runs on
+native tensor cores (8.9 and above) or through Marlin emulation, which changes
+how the high-concurrency cells should be read and is worth knowing before the
+numbers exist rather than after.
+
+## Step 1: build the FP8 checkpoint
+
+Needs roughly 20 GB of RAM on CPU, less wall time on GPU if it is idle.
+
+```bash
+cd quantization-cpu
+uv run python quantize_qwen3_fp8.py --model-id Qwen/Qwen3-8B \
+    --output-dir ../bench/models/Qwen3-8B-FP8-DYNAMIC
+du -sh ../bench/models/Qwen3-8B-FP8-DYNAMIC
+```
+
+**Expected:** roughly 8 to 9 GB on disk, against about 16 GB for BF16. If it is
+still near 16 GB the scheme did not apply and the rest of the comparison is
+meaningless, so check this number before moving on.
+
+## Step 2: start the baseline server
+
+```bash
+cd bench
+bash scripts/serve_baseline_bf16.sh
+```
+
+In a second shell:
+
+```bash
+curl -s localhost:8000/health && echo OK
+curl -s localhost:8000/v1/models | python -m json.tool
+```
+
+**Paste back** the startup log line reporting KV cache size (it looks like
+`GPU KV cache size: N tokens`). That number has to be recorded for both configs:
+if it differs between them, the pinned `gpu_memory_utilization` did not do its
+job and the FP8 run is getting credit for a bigger cache.
+
+## Step 3: validate the client against vLLM's own benchmark
+
+Do this once. It is the evidence that the numbers in the thesis come from a
+correct instrument, and it belongs in the methodology section.
+
+```bash
+vllm bench serve --backend openai-chat --model qwen3-8b \
+    --endpoint /v1/chat/completions \
+    --dataset-name random --random-input-len 64 --random-output-len 128 \
+    --num-prompts 32 --max-concurrency 1 --ignore-eos
+```
+
+Then the same shape through this harness:
+
+```bash
+uv run python -m bench.run --config-id baseline_bf16 \
+    --classes c1_chat --concurrency 1 --requests-per-cell 32 --no-mlflow
+```
+
+**Paste back both.** Mean TTFT and mean TPOT should agree within a few percent.
+If they do not, the client is the suspect, not vLLM.
+
+## Step 4: measure the baseline
+
+```bash
+uv run python -m bench.run --config-id baseline_bf16
+```
+
+Runs all four classes at concurrency 1 and 32, 8 cells, roughly 10 to 20
+minutes depending on the GPU. Watch for two warnings:
+
+- `did not stop on length` means `ignore_eos` is not in force and output lengths
+  are not controlled, which invalidates the cell.
+- a non-zero `preemptions` metric means vLLM ran out of KV cache and evicted
+  running sequences, which inflates tail latency for reasons unrelated to the
+  config. Lower `--requests-per-cell` or `max_num_seqs` and rerun that cell.
+
+## Step 5: measure FP8
+
+Stop the baseline server, then:
+
+```bash
+bash scripts/serve_fp8_dynamic.sh
+# second shell, after /health answers:
+uv run python -m bench.run --config-id fp8_dynamic
+```
+
+At this point the MVP is complete and there is a result to look at. Step 9 works
+already. Everything below extends it with the sparsity 2x2.
+
+---
+
+## Step 6: build the W4A16 checkpoint
+
+The dense 4-bit cell, and the reference the sparse+quantized cell is measured
+against.
+
+```bash
+cd quantization-cpu
+uv run python quantize_qwen3_gptq.py --model-id Qwen/Qwen3-8B --scheme W4A16 \
+    --output-dir ../bench/models/Qwen3-8B-W4A16-GPTQ
+```
+
+## Step 7: build the two 2:4 checkpoints
+
+Both use the same calibration set as Step 6. A different one would turn the
+sparsity comparison into a sparsity-plus-calibration comparison.
+
+```bash
+uv run python prune_qwen3_24.py --scheme none \
+    --output-dir ../bench/models/Qwen3-8B-2of4
+uv run python prune_qwen3_24.py --scheme W4A16 \
+    --output-dir ../bench/models/Qwen3-8B-2of4-W4A16
+```
+
+Then the check that matters:
+
+```bash
+uv run python verify_24_mask.py ../bench/models/Qwen3-8B-2of4
+uv run python verify_24_mask.py ../bench/models/Qwen3-8B-2of4-W4A16
+```
+
+**Paste back both.** `SparseGPTModifier` has a `preserve_sparsity_mask` flag and
+`GPTQModifier` does not, so whether the pattern survives the second stage is an
+open question, not a guarantee. The verifier prints `exact 2:4` per tensor and
+exits non-zero if the pattern is broken.
+
+Three outcomes to expect:
+
+- **exit 0 on both.** Proceed.
+- **exit 1 on the quantized one.** GPTQ overwrote the mask. The `sparse24_w4a16`
+  cell is invalid and must be dropped or rebuilt with a different recipe. Do not
+  benchmark it: vLLM may still serve it through `marlin-24` and produce a real
+  latency number for a model that is not actually sparse.
+- **exit 3 on the quantized one.** The weights are bit-packed and cannot be
+  inspected directly. Treat the mask as unconfirmed, and rely on the exit 0 from
+  the sparse-only checkpoint plus whatever vLLM logs at load time.
+
+Note that overall sparsity and mean zeros per group cannot distinguish 2:4 from
+random 50% sparsity: both read 0.50 and 2.00. Only the per-group exactness does,
+which is why the verifier reports that column.
+
+## Step 8: measure the two sparse configs
+
+```bash
+cd bench
+bash scripts/serve_w4a16_gptq.sh      # then, in a second shell:
+uv run python -m bench.run --config-id w4a16_gptq
+
+bash scripts/serve_sparse24_bf16.sh
+uv run python -m bench.run --config-id sparse24_bf16
+
+bash scripts/serve_sparse24_w4a16.sh
+uv run python -m bench.run --config-id sparse24_w4a16
+```
+
+Check the vLLM startup log for each sparse server: it should report a sparse or
+`marlin-24` kernel. If it loads the checkpoint as dense, the cell measures
+nothing and the mask or the config format is wrong.
+
+## Step 9: speculative decoding
+
+No draft model training. RedHatAI publishes an EAGLE-3 head for Qwen3-8B built
+with the speculators library, so this is a download and a server restart.
+
+```bash
+bash scripts/serve_bf16_eagle3.sh
+# second shell, after /health answers (first start also pulls the ~1 GB head):
+uv run python -m bench.run --config-id bf16_eagle3
+```
+
+`baseline_bf16` from Step 4 is the matching control: same model path, same
+quantization, differing only in the draft. Without that pair a speedup cannot be
+attributed to speculation rather than to whatever else changed.
+
+Then the quantized verifier, which is RQ2:
+
+```bash
+bash scripts/serve_fp8_eagle3.sh
+uv run python -m bench.run --config-id fp8_eagle3
+```
+
+**Paste back the summary lines.** They now carry `accept=` and `len=` per cell.
+Three things to check:
+
+- **Instrument validation, free.** The model card reports mean accepted length
+  at k=3 of 2.39 on HumanEval, 2.48 on GSM8K, 2.13 on CNN/DailyMail. Your `len=`
+  uses the same definition (1 + accepted/drafts). Landing in that band confirms
+  the speculative metrics the way Step 3 confirmed the latency client.
+- **A predicted ordering.** `c5_toolcall` should exceed all three of those
+  published numbers, and `c2_longform` should fall below them, because
+  acceptance tracks how predictable the continuation is. Confirming a prediction
+  made in advance is a stronger result than reporting an observed ordering.
+- **KV cache pressure.** Compare `kv_cache_usage_peak` against the same cell in
+  the non-speculative run. `gpu_memory_utilization` is pinned across configs, so
+  the draft model takes memory out of the same budget the KV cache draws on, and
+  the speculative server runs with a smaller cache than its own control. If
+  `preemptions` is non-zero here and zero in the control, the c=32 tail latency
+  is measuring cache starvation rather than speculation. The sweep warns when
+  that happens.
+
+If `len=` is absent from the output, the server exposed no speculative counters.
+Check `curl -s localhost:8000/metrics | grep spec_decode` against
+`metrics.COUNTERS`; the names have moved between vLLM versions.
+
+## Step 10: compare
+
+```bash
+uv run mlflow ui --port 5000
+```
+
+Group by `params.config_id`, filter to one `params.class_id` at a time.
+
+**Quantization ladder**, the four comparisons worth looking at first:
+
+| Cell | What it should show |
+|---|---|
+| `c2_longform` at c=1 | Largest FP8 win. Decode is memory bound, weights halved. |
+| `c3_rag` at c=1 | Smallest win, possibly negative on TTFT. Prefill is compute bound. |
+| `c1_chat` c=1 vs c=32 | Whether the win survives batching. On Ampere it may not. |
+| `c5_toolcall` | Baseline for the speculative phase, where this class should move most. |
+
+**Sparsity 2x2**, holding the prompt class and concurrency fixed:
+
+| | Dense | 2:4 | Effect of sparsity |
+|---|---|---|---|
+| **BF16** | `baseline_bf16` | `sparse24_bf16` | sparsity alone |
+| **W4A16** | `w4a16_gptq` | `sparse24_w4a16` | sparsity given quantization |
+
+The difference between those two rows is the interaction, and it is the part
+worth reporting. Expect the sparsity effect to be small next to quantization,
+roughly 1.1x to 1.3x, and largest in the bottom row where `marlin-24` combines
+both.
+
+**Speculative decoding**, with and without, at matched quantization:
+
+| | No draft | EAGLE-3 k=3 |
+|---|---|---|
+| **BF16** | `baseline_bf16` | `bf16_eagle3` |
+| **FP8** | `fp8_dynamic` | `fp8_eagle3` |
+
+Read `spec_mean_accepted_length` alongside every speedup. Acceptance is the
+explanation for the speedup, and a speedup reported without it is an observation
+rather than a finding. The BF16 row is the clean measurement of what speculation
+buys; the difference between the rows is whether a quantized verifier changes
+acceptance, which is RQ2.
+
+Expect the speedup to shrink or invert at c=32 in both rows. Rejected draft
+tokens are wasted compute, and that is affordable at batch 1 and not at batch 32.
+
+Report `ttft_s_p95` and `output_tps` separately throughout. A single speedup
+number would hide the fact that they can move in opposite directions, which is
+the finding the exposé is set up to make.
+
+## What is still unverified
+
+The mock proves the harness is internally correct. It cannot prove that vLLM
+streams exactly the chunk shapes assumed in `client._extract_delta`, that the
+served chat template matches the one the prompts were built against, or that
+the speculative counter names match this vLLM version. Step 3 catches the first
+two. For the third, `curl -s localhost:8000/metrics | grep spec_decode` once a
+draft model is running, and compare against `metrics.COUNTERS`.

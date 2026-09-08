@@ -1,0 +1,141 @@
+"""End-to-end checks of the load client against the mock vLLM.
+
+These are the tests that stand in for a GPU: they prove the client speaks the
+protocol correctly, measures TTFT at the first content token, and actually runs
+requests in parallel.
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from bench.client import run_load
+from bench.metrics import aggregate
+from bench.scenarios import Scenario, Turn
+
+MOCK_TTFT_S = 0.04
+MOCK_ITL_S = 0.008
+
+
+def _scenarios(n: int, max_tokens: int = 8, turns: int = 1) -> list[Scenario]:
+    out = []
+    for i in range(n):
+        out.append(
+            Scenario(
+                scenario_id=f"s-{i}",
+                class_id="c1_chat",
+                turns=[
+                    Turn(
+                        messages=[{"role": "user", "content": f"question {i} turn {t}"}],
+                        max_tokens=max_tokens,
+                        temperature=0.0,
+                        extra_body={"ignore_eos": True},
+                    )
+                    for t in range(turns)
+                ],
+            )
+        )
+    return out
+
+
+async def test_records_a_successful_request(mock_server):
+    result = await run_load(
+        _scenarios(1, max_tokens=8),
+        base_url=mock_server,
+        model="qwen3-8b",
+        concurrency=1,
+        num_requests=1,
+    )
+
+    assert len(result.records) == 1
+    record = result.records[0]
+    assert record.success, record.error
+    assert record.completion_tokens == 8
+    assert record.finish_reason == "length"
+    # One TTFT plus one gap per subsequent token.
+    assert len(record.itls) == 7
+    assert record.ttft == pytest.approx(MOCK_TTFT_S, abs=0.05)
+
+
+async def test_ttft_excludes_the_empty_role_chunk(mock_server):
+    """The first streamed chunk carries role and empty content.
+
+    Counting it would report a TTFT far below the truth, so the client waits for
+    the first chunk that actually carries generated text.
+    """
+    result = await run_load(
+        _scenarios(1, max_tokens=4),
+        base_url=mock_server,
+        model="qwen3-8b",
+        concurrency=1,
+        num_requests=1,
+    )
+    record = result.records[0]
+    assert record.ttft is not None
+    assert record.ttft >= MOCK_TTFT_S * 0.5
+
+
+async def test_requests_actually_run_in_parallel(mock_server):
+    per_request = MOCK_TTFT_S + 7 * MOCK_ITL_S
+    started = time.perf_counter()
+    result = await run_load(
+        _scenarios(8, max_tokens=8),
+        base_url=mock_server,
+        model="qwen3-8b",
+        concurrency=4,
+        num_requests=8,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert len(result.successful) == 8
+    # Serial execution would take 8x; a working pool of 4 takes roughly 2x.
+    assert elapsed < per_request * 6
+
+
+async def test_multi_turn_scenario_runs_turns_sequentially(mock_server):
+    """The path c7 will take. Single-turn classes are the degenerate case."""
+    result = await run_load(
+        _scenarios(1, max_tokens=4, turns=3),
+        base_url=mock_server,
+        model="qwen3-8b",
+        concurrency=1,
+        num_requests=1,
+    )
+
+    assert [r.turn_index for r in result.records] == [0, 1, 2]
+    assert all(r.success for r in result.records)
+    assert all(r.scenario_id == "s-0" for r in result.records)
+
+
+async def test_failed_request_is_recorded_not_raised(mock_server):
+    result = await run_load(
+        _scenarios(1),
+        base_url=mock_server + "/nope",
+        model="qwen3-8b",
+        concurrency=1,
+        num_requests=1,
+    )
+    record = result.records[0]
+    assert not record.success
+    assert record.error
+    # A failing cell still aggregates, so one bad config cannot abort a sweep.
+    assert aggregate(result).values["requests_failed"] == 1
+
+
+async def test_aggregate_over_a_real_load(mock_server):
+    result = await run_load(
+        _scenarios(8, max_tokens=16),
+        base_url=mock_server,
+        model="qwen3-8b",
+        concurrency=4,
+        num_requests=8,
+    )
+    values = aggregate(result).values
+
+    assert values["requests_ok"] == 8
+    assert values["output_tokens_total"] == 8 * 16
+    assert values["output_tps"] > 0
+    assert values["ttft_s_p95"] >= values["ttft_s_p50"]
+    assert values["tpot_s_p50"] == pytest.approx(MOCK_ITL_S, abs=0.02)

@@ -1,0 +1,126 @@
+# Server configurations under comparison.
+#
+# Everything in `defaults` is held constant across configs on purpose. In
+# particular `max_model_len` and `gpu_memory_utilization` are pinned: a
+# quantized model has smaller weights, so leaving these to vLLM's defaults
+# would silently hand it a larger KV cache and we would be measuring that
+# instead of the quantization.
+#
+# Adding a config: append an entry. `bench.server` renders the serve script
+# from it; no code changes.
+
+defaults:
+  host: 0.0.0.0
+  port: 8000
+  max_model_len: 16384
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 256
+  dtype: auto
+  seed: 0
+  extra_args:
+    # Prefix caching stays off for every single-turn class. A repeated system
+    # prompt would otherwise let later requests skip prefill and inflate
+    # whichever config happened to run second. c7 will re-enable it
+    # deliberately, as measuring reuse is the point of that class.
+    - "--no-enable-prefix-caching"
+
+configs:
+  # --- Quantization ladder -------------------------------------------------
+
+  - id: baseline_bf16
+    name: Qwen3-8B BF16
+    model_path: Qwen/Qwen3-8B
+    served_model_name: qwen3-8b
+    quant_method: none
+    bit_width: "16"
+
+  - id: fp8_dynamic
+    name: Qwen3-8B FP8 W8A8 dynamic
+    # Produced by quantization-cpu/quantize_qwen3_fp8.py. vLLM reads the
+    # compressed-tensors block out of the checkpoint's config.json, so no
+    # --quantization flag is needed.
+    model_path: ./models/Qwen3-8B-FP8-DYNAMIC
+    served_model_name: qwen3-8b
+    quant_method: fp8_dynamic
+    bit_width: "8"
+
+  # --- Sparsity 2x2: {dense, 2:4} x {BF16, W4A16} --------------------------
+  #
+  # baseline_bf16 above is the fourth cell (dense, BF16). The point of running
+  # all four rather than only the combined one is decomposition: a single
+  # sparse+quantized config cannot say how much of its speedup came from
+  # sparsity, and the interaction is the part worth reporting.
+  #
+  # 2:4 is 50% by definition of the hardware pattern. There is no sparsity
+  # ratio to sweep, because anything other than two zeros in four falls back to
+  # unstructured, for which vLLM has no kernel.
+
+  - id: w4a16_gptq
+    name: Qwen3-8B W4A16 GPTQ (dense)
+    model_path: ./models/Qwen3-8B-W4A16-GPTQ
+    served_model_name: qwen3-8b
+    quant_method: gptq
+    bit_width: "4"
+
+  - id: sparse24_bf16
+    name: Qwen3-8B 2:4 sparse, BF16
+    # Produced by quantization-cpu/prune_qwen3_24.py --scheme none
+    model_path: ./models/Qwen3-8B-2of4
+    served_model_name: qwen3-8b
+    quant_method: none
+    bit_width: "16"
+    sparsity_method: sparsegpt
+    sparsity_ratio: 0.5
+    sparsity_pattern: "2:4"
+
+  - id: sparse24_w4a16
+    name: Qwen3-8B 2:4 sparse + W4A16 GPTQ
+    # Produced by quantization-cpu/prune_qwen3_24.py --scheme W4A16.
+    # Serves through the marlin-24 kernel. Confirm the mask survived GPTQ with
+    # `python verify_24_mask.py <dir>` before trusting this cell.
+    model_path: ./models/Qwen3-8B-2of4-W4A16
+    served_model_name: qwen3-8b
+    quant_method: gptq
+    bit_width: "4"
+    sparsity_method: sparsegpt
+    sparsity_ratio: 0.5
+    sparsity_pattern: "2:4"
+
+  # --- Speculative decoding ------------------------------------------------
+  #
+  # No draft model training required. RedHatAI publishes an EAGLE-3 head for
+  # Qwen3-8B trained with the speculators library, which is the same toolchain
+  # the study already uses:
+  #   https://huggingface.co/RedHatAI/Qwen3-8B-speculator.eagle3
+  #
+  # k=3 is the value its model card recommends, not the 5 that reads as a
+  # natural default. Raising k costs draft compute on every step and only pays
+  # off if acceptance stays high that deep.
+  #
+  # The head was trained against BF16 Qwen3-8B. Pairing it with a quantized
+  # verifier is not a compromise, it is RQ2: the acceptance criterion then
+  # verifies against an already-degraded distribution. bf16_eagle3 is the
+  # control that makes that comparison readable.
+  #
+  # Use the non-thinking head. There is a separate Qwen3-8B-Thinking variant,
+  # and it is the right one only if c8_thinking is enabled.
+
+  - id: bf16_eagle3
+    name: Qwen3-8B BF16 + EAGLE-3
+    model_path: Qwen/Qwen3-8B
+    served_model_name: qwen3-8b
+    quant_method: none
+    bit_width: "16"
+    spec_method: eagle3
+    num_speculative_tokens: 3
+    draft_model_path: RedHatAI/Qwen3-8B-speculator.eagle3
+
+  - id: fp8_eagle3
+    name: Qwen3-8B FP8 + EAGLE-3
+    model_path: ./models/Qwen3-8B-FP8-DYNAMIC
+    served_model_name: qwen3-8b
+    quant_method: fp8_dynamic
+    bit_width: "8"
+    spec_method: eagle3
+    num_speculative_tokens: 3
+    draft_model_path: RedHatAI/Qwen3-8B-speculator.eagle3

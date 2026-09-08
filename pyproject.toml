@@ -1,0 +1,28 @@
+[project]
+name = "bench"
+version = "0.1.0"
+description = "Latency/throughput benchmark harness for quantized and speculatively decoded SLM serving on vLLM."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+    "mlflow>=2.19",
+    "transformers>=4.51",
+]
+
+[project.optional-dependencies]
+# Only needed to build the frozen prompt sets and to run the mock server; the
+# sweep itself talks to a real vLLM over HTTP and needs neither.
+mock = ["fastapi>=0.115", "uvicorn>=0.34"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bench"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
