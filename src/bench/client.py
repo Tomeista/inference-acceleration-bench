@@ -283,7 +283,12 @@ async def run_load(
 
 
 async def warmup(
-    scenarios: list[Scenario], *, base_url: str, model: str, num_requests: int = 4
+    scenarios: list[Scenario],
+    *,
+    base_url: str,
+    model: str,
+    num_requests: int = 4,
+    concurrency: int | None = None,
 ) -> None:
     """Discarded requests that pay for CUDA graph capture and kernel autotuning.
 
@@ -295,6 +300,6 @@ async def warmup(
         scenarios,
         base_url=base_url,
         model=model,
-        concurrency=min(num_requests, 4),
+        concurrency=concurrency or min(num_requests, 4),
         num_requests=num_requests,
     )

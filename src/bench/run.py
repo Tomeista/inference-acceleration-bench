@@ -205,9 +205,10 @@ async def main_async(args: argparse.Namespace) -> int:
         )
 
     if args.warmup:
+        peak = max(concurrencies)
         print(
-            f"warmup      : {args.warmup} requests on {classes[0].id}"
-            + (f", {WARMUP_PER_EXTRA_CLASS} short on each other class" if len(classes) > 1 else "")
+            f"warmup      : {args.warmup} requests on {classes[0].id}, then "
+            f"{max(WARMUP_PER_EXTRA_CLASS, peak)} short at c={peak} on every class"
         )
         await warmup(
             read_scenarios(classes[0].prompt_file),
@@ -215,17 +216,19 @@ async def main_async(args: argparse.Namespace) -> int:
             model=cfg.served_model_name,
             num_requests=args.warmup,
         )
-        # Every other class too. vLLM JIT-compiles some Triton kernels on first
-        # use, and a class can be the first to reach one (the top-k/top-p kernel
-        # on the first sampled batch, seen on the GB10); that one-off stall would
-        # otherwise land in the class's first measured request. Short replies
-        # are enough, since what compiles depends on the path, not the length.
-        for cls in classes[1:]:
+        # Every class, at the run's peak concurrency. vLLM JIT-compiles some
+        # Triton kernels on first use, and which path a step takes can depend on
+        # batch size: on the GB10 the top-k/top-p kernel compiled only once a
+        # sampled batch reached c=32, inside the first measured wave of
+        # c2_longform, adding ~3 s to all 32 of its TTFTs. Short replies are
+        # enough, since what compiles depends on the path, not the length.
+        for cls in classes:
             await warmup(
                 shortened(read_scenarios(cls.prompt_file)),
                 base_url=base_url,
                 model=cfg.served_model_name,
-                num_requests=WARMUP_PER_EXTRA_CLASS,
+                num_requests=max(WARMUP_PER_EXTRA_CLASS, peak),
+                concurrency=peak,
             )
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
