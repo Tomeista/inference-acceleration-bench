@@ -1,7 +1,7 @@
 [project]
 name = "bench"
 version = "0.1.0"
-description = "Latency/throughput benchmark harness for quantized and speculatively decoded SLM serving on vLLM."
+description = "Latency/throughput and quality benchmark harness for quantized and speculatively decoded SLM serving on vLLM."
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28",
@@ -15,6 +15,12 @@ dependencies = [
 # sweep itself talks to a real vLLM over HTTP and needs neither.
 mock = ["fastapi>=0.115", "uvicorn>=0.34"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+# Only `bench.build_evals` needs this, and only to rebuild the frozen eval sets
+# from HuggingFace. The sets are committed, so running the quality pass -- like
+# running the speed sweep -- needs neither the extra nor the network. pyarrow
+# rather than `datasets`: the builder reads pinned parquet files over plain
+# HTTP, which is the whole of what that dependency would be for.
+evals = ["pyarrow>=14"]
 
 [build-system]
 requires = ["hatchling"]

@@ -12,8 +12,9 @@ from pathlib import Path
 
 import yaml
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
-PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_DIR = REPO_ROOT / "config"
+PROMPTS_DIR = REPO_ROOT / "prompts"
 
 
 @dataclass(frozen=True)

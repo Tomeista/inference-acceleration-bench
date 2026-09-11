@@ -12,6 +12,7 @@ not modeled, so nothing it produces is a performance result.
 
     uvicorn tests.mock_server:app --port 8000
     MOCK_TTFT_MS=40 MOCK_ITL_MS=8 MOCK_SPEC=1 uvicorn tests.mock_server:app --port 8000
+    MOCK_REPLY="Answer: C" uvicorn tests.mock_server:app --port 8000
 """
 
 from __future__ import annotations
@@ -37,6 +38,23 @@ SPEC_ENABLED = os.environ.get("MOCK_SPEC", "0") == "1"
 SPEC_ACCEPT = float(os.environ.get("MOCK_SPEC_ACCEPT", "0.7"))
 NUM_SPEC_TOKENS = int(os.environ.get("MOCK_SPEC_TOKENS", "5"))
 MODEL_NAME = os.environ.get("MOCK_MODEL", "qwen3-8b")
+
+
+def scripted_reply() -> str | None:
+    """A literal reply to emit instead of filler, or None for the filler.
+
+    The quality pass scores generated text, so a mock that always says "the
+    quick brown fox" can exercise the request loop but not the scorer, the
+    answer-key join, or the reference comparison. Setting this to "Answer: C"
+    turns the mock into a server with a known, checkable accuracy against the
+    real committed eval set -- which is what lets the whole scoring path be
+    tested without a GPU.
+
+    Read per request rather than at import, so one server instance can play
+    several roles across a test session.
+    """
+    return os.environ.get("MOCK_REPLY")
+
 
 _state = {
     "in_flight": 0,
@@ -123,6 +141,24 @@ async def chat_completions(request: Request):
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
     prompt_tokens = _estimate_prompt_tokens(messages, tools)
 
+    # Filler always runs to max_tokens and finishes on length: ignore_eos is
+    # what the speed sweep relies on for a fixed output length. A scripted
+    # reply instead stops where it ends, one "token" per word, which is what
+    # makes max_tokens bite the way it would on a real server -- a reply
+    # longer than the cap comes back truncated and finishes on "length", so
+    # the quality pass's truncation accounting has something real to measure.
+    reply = scripted_reply()
+    if reply is None:
+        pieces = [WORDS[i % len(WORDS)] + " " for i in range(max_tokens)]
+        finish = "length"
+    else:
+        words = reply.split(" ")
+        pieces = [w + " " for w in words[:-1]] + [words[-1]]
+        truncated = len(pieces) > max_tokens
+        pieces = pieces[:max_tokens]
+        finish = "length" if (truncated or body.get("ignore_eos")) else "stop"
+    n_out = len(pieces)
+
     if not body.get("stream"):
         return JSONResponse(
             {"error": "this mock only implements streaming"}, status_code=400
@@ -140,20 +176,17 @@ async def chat_completions(request: Request):
             await asyncio.sleep(TTFT_MS / 1000.0 * factor)
             yield _chunk(request_id, created, model, {"role": "assistant", "content": ""})
 
-            for i in range(max_tokens):
+            for i, piece in enumerate(pieces):
                 if i:
                     await asyncio.sleep(ITL_MS / 1000.0 * factor)
-                word = WORDS[i % len(WORDS)]
-                yield _chunk(request_id, created, model, {"content": word + " "})
+                yield _chunk(request_id, created, model, {"content": piece})
 
-            # ignore_eos is what the harness relies on for a fixed output
-            # length, so the mock always terminates on length.
-            yield _chunk(request_id, created, model, {}, finish="length")
+            yield _chunk(request_id, created, model, {}, finish=finish)
 
             _state["prompt_tokens"] += prompt_tokens
-            _state["generation_tokens"] += max_tokens
+            _state["generation_tokens"] += n_out
             if SPEC_ENABLED:
-                drafts = max_tokens / max(1.0, 1.0 + SPEC_ACCEPT * NUM_SPEC_TOKENS)
+                drafts = n_out / max(1.0, 1.0 + SPEC_ACCEPT * NUM_SPEC_TOKENS)
                 _state["spec_drafts"] += drafts
                 _state["spec_draft_tokens"] += drafts * NUM_SPEC_TOKENS
                 _state["spec_accepted_tokens"] += drafts * NUM_SPEC_TOKENS * SPEC_ACCEPT
@@ -167,8 +200,8 @@ async def chat_completions(request: Request):
                     "choices": [],
                     "usage": {
                         "prompt_tokens": prompt_tokens,
-                        "completion_tokens": max_tokens,
-                        "total_tokens": prompt_tokens + max_tokens,
+                        "completion_tokens": n_out,
+                        "total_tokens": prompt_tokens + n_out,
                     },
                 }
                 yield f"data: {json.dumps(usage)}\n\n"

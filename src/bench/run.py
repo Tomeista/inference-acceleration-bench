@@ -19,16 +19,15 @@ import asyncio
 import json
 import sys
 import time
-from pathlib import Path
 
 from bench import metrics as metrics_mod
 from bench import tracking
-from bench.classes import PromptClass, select_classes
+from bench.classes import REPO_ROOT, PromptClass, select_classes
 from bench.client import run_load, warmup
 from bench.scenarios import read_scenarios
 from bench.server import ServerConfig, load_configs, server_info, wait_for_ready, write_serve_scripts
 
-ARTIFACT_ROOT = Path(__file__).resolve().parents[2] / "results"
+ARTIFACT_ROOT = REPO_ROOT / "results"
 
 
 def auto_requests(concurrency: int) -> int:
@@ -203,7 +202,7 @@ async def main_async(args: argparse.Namespace) -> int:
     artifact_dir = ARTIFACT_ROOT / f"{cfg.id}-{stamp}"
 
     if args.mlflow:
-        tracking.setup(args.experiment)
+        tracking.setup(args.experiment, tracking_uri=args.tracking_uri)
 
     parent_params = {
         **cfg.as_params(),
@@ -287,13 +286,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--warmup", type=int, default=8, help="Discarded requests before measuring")
     parser.add_argument("--experiment", default=tracking.DEFAULT_EXPERIMENT)
+    parser.add_argument(
+        "--tracking-uri",
+        default=None,
+        help="Defaults to MLFLOW_TRACKING_URI, else mlflow.db at the repo root",
+    )
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--ready-timeout", type=float, default=600.0)
     parser.add_argument(
         "--collect-output",
         action="store_true",
-        help="Keep generated text in memory; needed later for the quality pass",
+        help="Keep generated text in memory (not scoreable: see bench.quality)",
     )
     parser.add_argument("--no-mlflow", dest="mlflow", action="store_false", default=True)
     parser.add_argument("--dry-run", action="store_true")

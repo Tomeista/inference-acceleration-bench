@@ -1,7 +1,8 @@
 # bench
 
 Latency and throughput measurement for quantized and speculatively decoded
-Qwen3-8B served on vLLM. Results land in MLflow.
+Qwen3-8B served on vLLM, plus a quality pass that scores what each config gets
+wrong in exchange for its speed. Results land in MLflow.
 
 See `RUNBOOK.md` for the steps to run on the GPU server, and the
 [experimental design summary](https://claude.ai/code/artifact/3408fccd-2da2-419b-b3ea-de0a802a4701)
@@ -132,8 +133,8 @@ between two configs could be prompt-length drift.
 
 **Output lengths are pinned.** Every request sets `ignore_eos` with a fixed
 `max_tokens`, so a config that happens to stop early cannot look faster than it
-is. Runs assert that every request finished on `length`. The quality pass will
-run separately with natural stopping.
+is. Runs assert that every request finished on `length`. The quality pass runs
+separately with natural stopping; see below.
 
 **Thinking is off.** Qwen3 reasons by default, which would make output length a
 property of the model's mood rather than of the class. `c8_thinking` exists to
@@ -147,12 +148,103 @@ silently receive a larger KV cache and get credited for the difference.
 `scripts/serve_*.sh` from `config/configs.yaml`, so the command that produced a
 measurement lives in version control next to the measurement.
 
+**Re-measurements are merged, not averaged.** MLflow appends, so a cell measured
+twice has two runs, and a naive group-by blends a discarded measurement with the
+one that replaced it. `bench.report` keeps the most recent cell per
+`(config_id, class_id, concurrency)`, says how many it superseded, and hides
+cells that failed a validity check (failed requests, output not length-capped,
+preemptions) unless asked for them.
+
+## The quality pass
+
+Every number above gets *better* as compression increases. That is the half of
+the trade the speed sweep can see, and on its own it argues for the most
+aggressive config. So there is a second pass, `bench.quality`, that scores
+what the configs actually say.
+
+It inverts nearly every choice the speed sweep makes, because the two want
+opposite things from a generation:
+
+| | `bench.run` | `bench.quality` |
+|---|---|---|
+| stopping | `ignore_eos`, length pinned | natural, truncation counted |
+| prompts | shapes with no right answer | benchmark items with a key |
+| configs | all 7 | the 5 flagged `quality: true` |
+| output | discarded | scored and kept per item |
+
+What it does *not* invert is the server: the same `scripts/serve_<config>.sh`,
+the same `max_model_len` and memory pin. Prefix caching changes how fast a
+config answers, never what it answers.
+
+**Five configs, not seven.** The quantization ladder and the sparsity 2x2 --
+every config whose weights differ from `baseline_bf16`. The two EAGLE-3 configs
+are left out because greedy speculative decoding is verified by the target
+model, so it answers what its verifier answers; scoring one is a losslessness
+check against its control (`--force --reference fp8_dynamic`), not a quality
+measurement. A test asserts every weight-changing config stays in the subset.
+
+**Three suites, all general, all zero-shot.** MMLU stratified across all 57
+subjects (one letter of output), MMLU-Pro stratified across its 14 categories
+(also one letter, and here for headroom -- see below), and GSM8K
+chain-of-thought (~250 decode tokens an item, and the sensitive half:
+quantization damage shows up in a chain of dependent steps long before it shows
+up in a single recall lookup). All 250 items each, frozen into `evals/` with
+digests exactly as `prompts/` is, and pinned to a dataset commit rather than to
+`main`. Every request is greedy (`temperature 0`, `top_k 1`) with thinking off.
+
+Any one suite can be run alone with `--suites`, which is what makes re-scoring a
+single cell affordable:
+
+```bash
+uv run python -m bench.quality --config-id w4a16_gptq --suites mmlu_pro
+```
+
+**Why MMLU-Pro, and what it does not add.** Qwen3-8B sits high enough on MMLU
+that there is little room between the BF16 reference and the ceiling for damage
+to show. MMLU-Pro keeps the same cheap shape while moving the reference down and
+the random floor to 10%, roughly four times the space to fall through. It is
+*not* an independent second reading: 6,810 of its 12,032 items are MMLU
+questions, so the two scores are correlated by construction (155 of the frozen
+250). Each key row carries the item's `src`, so the overlap stays auditable. It
+is also built to reward chain-of-thought, which this pass disables; if
+`baseline_bf16` shows a high `truncated_rate` or `unparseable_rate` there, the
+fix is a larger budget and a re-run of every config, not a scorer change.
+
+**These numbers will not match published MMLU or GSM8K scores, and are not meant
+to.** Published figures are few-shot and scored by log-likelihood ranking over
+the options; these are zero-shot and scored by reading generated text. What the
+pass measures is each config against *its own BF16 reference on identical
+items*, which is the quantity the question asks for. Contamination cancels for
+the same reason: every comparison is the same base model against itself.
+
+**Accuracy is the headline and the blunt instrument; agreement is the sensitive
+one.** `agreement_with_reference` is the fraction of items a config answers
+identically to `baseline_bf16`, paired item by item. A config can hold its
+accuracy while churning a third of its answers, and only the paired metric sees
+that. The report never prints an accuracy without its Wilson interval, because
+at 250 items that interval is about ±6 points -- wider than most pairs of
+configs will differ by.
+
+**Two failure modes are counted separately from being wrong.**
+`unparseable_rate` is a config that has stopped answering in the requested
+format -- instruction-following usually breaks before accuracy does -- and
+`repetition_ratio` is a config stuck in a loop. **Truncation is counted, never
+scored as wrong**: a reply cut off at `max_tokens` is an unmeasured item, and
+above 5% the report flags the cell and its accuracy is a lower bound.
+
+The honest limit: three benchmarks at 250 items is a coarse instrument. It is
+enough to say whether a config's damage is visible, not to rank two configs
+whose agreement differs by a point. See the RUNBOOK's determinism floor for how
+small a difference is readable at all.
+
 ## Layout
 
 ```
-config/classes.yaml     prompt class definitions
-config/configs.yaml     server configurations
+config/classes.yaml     prompt class definitions (speed)
+config/configs.yaml     server configurations; `quality: true` marks the scored subset
+config/suites.yaml      benchmark suite definitions (quality)
 prompts/                frozen prompt sets, committed
+evals/                  frozen benchmark items + answer keys + manifest.json, committed
 scripts/                generated serve scripts, committed
 src/bench/
   classes.py            class config loader
@@ -161,9 +253,14 @@ src/bench/
   build_prompts.py      exact-token-budget prompt builder
   client.py             async load generator
   metrics.py            percentiles, aggregation, /metrics scrape
-  server.py             config loader, serve scripts, readiness probe
+  server.py             config loader, serve scripts, readiness probe, context guard
   tracking.py           MLflow parent/child runs
-  run.py                sweep driver
+  run.py                speed sweep driver
+  quality.py            quality pass driver and preflight
+  scoring.py            answer extraction, Wilson intervals, degeneracy measures
+  suites.py             suite loader; pairs frozen items with their answer keys
+  build_evals.py        one-time eval-set builder; output committed, not run-path
+  report.py             the most-recent-wins merge rule, for both passes
 tests/mock_server.py    fake vLLM, so the harness is testable without a GPU
 ```
 
@@ -172,9 +269,14 @@ tests/mock_server.py    fake vLLM, so the harness is testable without a GPU
 **A new prompt class** is an entry in `config/classes.yaml` plus a builder
 registered in `build_prompts.BUILDERS` under the same `source` name.
 
+**A new benchmark suite** is an entry in `config/suites.yaml` plus a builder
+registered in `build_evals.BUILDERS` under the same `source` name. Build it once
+with `uv run --extra evals python -m bench.build_evals --suites <id>` and commit
+the output; the manifest entries for the other suites are kept.
+
 **A new quantization, sparsity, or speculative config** is an entry in
 `config/configs.yaml`. No code changes; `--emit-scripts` regenerates the serve
-script. Sparsity needed nothing beyond three metadata fields on `ServerConfig`,
+script. Add `quality: true` if it changes the weights. Sparsity needed nothing beyond three metadata fields on `ServerConfig`,
 because vLLM reads the pattern out of the checkpoint rather than from a flag.
 
 **Checkpoints** are built in `../quantization-cpu/`: `quantize_qwen3_fp8.py`,
@@ -204,11 +306,27 @@ continuation, so c5 and c6 need real prompts before those numbers mean anything.
 
 ```bash
 uv sync --extra mock --extra dev
-uv run pytest -q
+uv run pytest -q                            # 164 tests
 uv run python -m bench.build_prompts
+uv run python -m bench.build_evals --check  # eval-set digests, no network
 ```
 
 The mock vLLM in `tests/mock_server.py` speaks enough of the OpenAI streaming
 protocol and vLLM's Prometheus output that `bench.run` cannot tell the
 difference. It is a protocol stub, not a simulator: its latencies are
 configured, not modeled, so nothing it produces is a performance result.
+
+With `MOCK_REPLY` set it answers every request with that literal text, which
+makes it a server with a known and therefore checkable accuracy against the real
+committed eval sets. That is how the whole quality path -- digest checks, the
+answer-key join, scoring, the reference comparison and the MLflow nesting -- is
+tested without a GPU. Nothing it produces is a quality result either.
+
+All three entry points (`bench.run`, `bench.quality`, `bench.report`) default
+to the same store, `mlflow.db` at the repository root, wherever they are
+launched from. `MLFLOW_TRACKING_URI` or `--tracking-uri` overrides it.
+
+`uv run --extra evals python -m bench.build_evals` reproduces all six committed
+eval files byte-for-byte from the pinned dataset commits. That has been checked,
+so a rebuild that reports different digests has changed something, and every
+config scored before it is no longer comparable with every config scored after.

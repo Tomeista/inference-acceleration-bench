@@ -8,8 +8,9 @@ been run and verified on the workstation.
 
 ```bash
 uv sync --extra mock --extra dev
-uv run pytest -q                    # 45 passed
-uv run python -m bench.build_prompts # 512/512 prompts land on their exact budget
+uv run pytest -q                        # 164 passed
+uv run python -m bench.build_prompts    # 512/512 prompts land on their exact budget
+uv run python -m bench.build_evals --check   # all six eval files match the manifest
 ```
 
 Smoke test of the whole sweep against the mock vLLM, which is how the client,
@@ -21,6 +22,19 @@ MOCK_TTFT_MS=15 MOCK_ITL_MS=1 uv run uvicorn --app-dir tests mock_server:app --p
 uv run python -m bench.run --config-id baseline_bf16 --server-url http://127.0.0.1:8111 \
     --requests-per-cell 24 --concurrency 1,8
 ```
+
+And of the quality pass, with the mock answering "Answer: C" to everything:
+
+```bash
+MOCK_REPLY="Answer: C" uv run uvicorn --app-dir tests mock_server:app --port 8112 &
+uv run python -m bench.quality --config-id baseline_bf16 --server-url http://127.0.0.1:8112 \
+    --n-items 20 --no-mlflow
+rm -r results/quality      # the mock's answers must never become the reference
+```
+
+The `rm` is not optional. The pass writes each config's per-item answers to
+`results/quality/`, and a `baseline_bf16.jsonl` produced by the mock would be
+joined against by the first real config scored after it.
 
 ---
 
@@ -241,7 +255,23 @@ Check `curl -s localhost:8000/metrics | grep spec_decode` against
 ## Step 10: compare
 
 ```bash
-uv run mlflow ui --port 5000
+uv run python -m bench.report                 # one table per class and concurrency
+uv run python -m bench.report --all           # including cells that failed a check
+uv run python -m bench.report --csv speed.csv # the merged table, for plotting
+```
+
+**Use this rather than reading cells out of the UI by hand**, for one specific
+reason: MLflow appends, so a cell that was measured twice has two runs, and
+nothing in the UI stops a group-by from averaging a discarded measurement with
+the one that replaced it. `bench.report` keeps the most recent cell per
+`(config_id, class_id, concurrency)`, names the ones it superseded, and drops
+cells with failed requests, output that was not length-capped, or preemptions
+unless `--all` is given.
+
+The UI is still the right tool for looking at one run:
+
+```bash
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
 ```
 
 Group by `params.config_id`, filter to one `params.class_id` at a time.
@@ -287,6 +317,136 @@ Report `ttft_s_p95` and `output_tps` separately throughout. A single speedup
 number would hide the fact that they can move in opposite directions, which is
 the finding the exposé is set up to make.
 
+## Step 11: the quality pass
+
+The speed sweep says a config got faster. It cannot say what that cost, because
+every prompt in it runs with `ignore_eos` so that content cannot affect timing.
+This pass scores instead, on the five configs flagged `quality: true`: the
+quantization ladder and the sparsity 2x2.
+
+**Same servers, same scripts.** Prefix caching changes how fast a config
+answers, not what it answers, so there is no second serve-script set to keep in
+sync.
+
+```bash
+uv run python -m bench.build_evals --check   # digests only, no network
+bash scripts/serve_baseline_bf16.sh
+# second shell, after /health answers:
+uv run python -m bench.quality --config-id baseline_bf16 --preflight
+```
+
+**Paste back the preflight.** It checks the mirror image of what the speed sweep
+relies on: that generation stops *naturally*. If every reply stops at
+`max_tokens`, something is forcing length and nothing can be scored honestly. It
+also fails when no answer parses out of any of the four replies, which at BF16
+means the chat template is not rendering the prompt as it was built. The line
+`extracted answers` should hold four letters.
+
+Then the sweep, one server at a time. **`baseline_bf16` must go first** --
+every other config's `agreement_with_reference` is a per-item join against the
+answers it wrote:
+
+```bash
+uv run python -m bench.quality --config-id baseline_bf16
+# stop the server, start the next one, and so on:
+uv run python -m bench.quality --config-id fp8_dynamic
+uv run python -m bench.quality --config-id w4a16_gptq
+uv run python -m bench.quality --config-id sparse24_bf16
+uv run python -m bench.quality --config-id sparse24_w4a16
+```
+
+`mmlu` and `mmlu_pro` are one letter of output per item and cost a few minutes
+a config; `gsm8k` is ~250 decode tokens x 250 items and dominates the pass. It
+runs at concurrency 32, pinned across configs. Do not delete `results/quality/`
+mid-sweep -- that is where the reference answers live, and losing them costs
+the agreement column.
+
+**Running one suite at a time.** `--suites` takes a comma-separated list and
+defaults to every enabled suite. Re-scoring one benchmark after a scorer fix, or
+adding a suite to configs already measured, does not mean re-running the others:
+
+```bash
+uv run python -m bench.quality --config-id baseline_bf16 --suites mmlu_pro
+uv run python -m bench.quality --config-id w4a16_gptq --suites mmlu_pro
+```
+
+The reference still goes first: its answers are stored per suite at
+`results/quality/<suite>/baseline_bf16.jsonl`, so a suite never run on it has
+nothing to join against. The report merges the new cells in beside the old ones
+by the same most-recent-wins rule a re-measured speed cell uses.
+
+### The determinism floor, once
+
+vLLM batches, and batch composition changes floating-point reduction order, so
+two runs of the *same* weights can differ by a token. Measure how much before
+reading any small difference as a result:
+
+```bash
+bash scripts/serve_baseline_bf16.sh
+uv run python -m bench.quality --config-id baseline_bf16 --concurrency 1 --suffix c1
+```
+
+Same config, same prompts, different batching. The `agree` figure on that row
+is self-agreement, and **no agreement gap smaller than its complement is a
+result.** If it comes back below ~0.99, say so in the write-up and treat it as
+the noise floor. The `--suffix` keeps it as its own row rather than superseding
+the c=32 measurement.
+
+### Optional: speculative decoding is lossless
+
+Greedy EAGLE-3 is verified by the target model, so it should answer what its
+control answers. That is checkable with the same machinery, against the control
+rather than against BF16:
+
+```bash
+bash scripts/serve_fp8_eagle3.sh
+uv run python -m bench.quality --config-id fp8_eagle3 --force --reference fp8_dynamic
+```
+
+Expect `agree` at the determinism floor, not above it. Anything clearly below
+it means the speculative server is not producing its verifier's output, and
+every speedup measured on it in Step 9 is a speedup at a different quality.
+
+### Reading it
+
+```bash
+uv run python -m bench.report --quality
+uv run python -m bench.report --quality --csv quality.csv
+```
+
+**Accuracy is the headline and the blunter instrument.** At 250 items the 95%
+interval is about ±6 points -- wider than most pairs of configs will differ by.
+The table never prints the point estimate without the interval, for exactly that
+reason.
+
+**`agree` is where damage will actually show.** It is paired per item, so it
+sees a config changing a third of its answers even when accuracy has not moved.
+The two comparisons read the same way as the speed tables: down the
+quantization ladder (`fp8_dynamic`, then `w4a16_gptq`), and across the sparsity
+2x2, where the interaction is the part worth reporting.
+
+**`unparse` and `rep` are the failure modes, separated on purpose.** A config
+that stops emitting `Answer: C` has degraded even where its parseable answers
+are right; one stuck in a loop has degraded differently again. Both usually
+move on `gsm8k` before anything moves on `mmlu`.
+
+### Warnings that mean stop
+
+- **`truncated=NN%`** above ~5%. Replies are being cut off at `max_tokens`, so
+  those items are unmeasured rather than wrong and the accuracy is a lower
+  bound. Raise the suite's `max_tokens` and re-run **every** config -- a suite
+  measured at two different caps is two different suites.
+- **`unparse` high on `baseline_bf16` or `fp8_dynamic`.** This is a scorer bug,
+  not a model result. Read `results/quality/<suite>/<config>.jsonl`, which keeps
+  the raw text for this purpose, before believing the table.
+- **digest failure from `build_evals --check`.** The eval sets have drifted from
+  the manifest; configs measured either side of that are not comparable.
+- **`the reference answers ... were produced against eval sets ...`.** A stale
+  `results/quality/<suite>/baseline_bf16.jsonl`, from before the eval sets were
+  rebuilt. It joins by item id perfectly well and the agreement column would be
+  about nothing. Each items file carries a `.meta.json` recording what produced
+  it, which is what catches this. Re-run the reference config.
+
 ## What is still unverified
 
 The mock proves the harness is internally correct. It cannot prove that vLLM
@@ -295,3 +455,10 @@ served chat template matches the one the prompts were built against, or that
 the speculative counter names match this vLLM version. Step 3 catches the first
 two. For the third, `curl -s localhost:8000/metrics | grep spec_decode` once a
 draft model is running, and compare against `metrics.COUNTERS`.
+
+For the quality pass, the mock cannot prove that vLLM honours the three
+non-OpenAI fields every eval request carries (`top_k`, `seed`,
+`chat_template_kwargs`). Step 11's preflight catches the one that matters most:
+if `enable_thinking: false` were dropped, Qwen3 would open every reply with a
+reasoning block, and the MMLU replies would run into their 16-token cap before
+naming a letter.

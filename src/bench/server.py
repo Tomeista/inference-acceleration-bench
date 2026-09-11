@@ -19,9 +19,9 @@ from typing import Any
 import httpx
 import yaml
 
-from bench.classes import CONFIG_DIR
+from bench.classes import CONFIG_DIR, REPO_ROOT
 
-SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,10 @@ class ServerConfig:
     spec_method: str = "none"
     num_speculative_tokens: int = 0
     draft_model_path: str = ""
+    # Whether `bench.quality` scores this config. Carried in the config rather
+    # than in a shell loop so the scored set is a property of the study, and so
+    # a test can assert it still covers every quantization and sparsity cell.
+    quality: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
     max_model_len: int = 16384
@@ -67,6 +71,7 @@ class ServerConfig:
             "sparsity_pattern": self.sparsity_pattern,
             "spec_method": self.spec_method,
             "num_speculative_tokens": self.num_speculative_tokens,
+            "quality_subset": self.quality,
             "max_model_len": self.max_model_len,
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "max_num_seqs": self.max_num_seqs,
@@ -213,3 +218,29 @@ def server_info(base_url: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         info["vllm_version"] = None
     return info
+
+
+def check_context_budget(cfg: ServerConfig, concurrency: int, longest_request: int) -> str | None:
+    """Reasons this config cannot honestly run a cell, or None.
+
+    Asking for more concurrency than `max_num_seqs` does not fail. vLLM queues
+    the excess, so the cell still returns numbers -- they are just the numbers
+    for `max_num_seqs` concurrency with a queue in front, not for the
+    concurrency the run claims to have measured.
+
+    A request longer than `max_model_len` is rejected by vLLM rather than
+    truncated, so that case surfaces as failed requests anyway; refusing up
+    front costs nothing and says why before a pass is spent finding out.
+    """
+    if concurrency > cfg.max_num_seqs:
+        return (
+            f"concurrency {concurrency} exceeds --max-num-seqs {cfg.max_num_seqs}: "
+            f"the excess would queue, and the cell would report queued latency "
+            f"as though it were concurrent latency"
+        )
+    if longest_request > cfg.max_model_len:
+        return (
+            f"requests need up to {longest_request} tokens but --max-model-len is "
+            f"{cfg.max_model_len}; raise max_model_len in config/configs.yaml"
+        )
+    return None

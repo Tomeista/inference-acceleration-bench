@@ -27,6 +27,15 @@ import mlflow
 
 DEFAULT_EXPERIMENT = "inference-acceleration"
 
+# This repository's own store, resolved against the repo rather than the
+# working directory, so the speed sweep, the quality pass and `bench.report`
+# all read and write the same file wherever they are launched from. Sqlite
+# rather than a directory of files: current MLflow refuses the filesystem
+# backend outright ("in maintenance mode").
+DEFAULT_TRACKING_URI = (
+    "sqlite:///" + (Path(__file__).resolve().parents[2] / "mlflow.db").as_posix()
+)
+
 
 def _clean_metrics(values: dict[str, Any]) -> dict[str, float]:
     """Drop anything MLflow cannot store as a metric.
@@ -80,15 +89,18 @@ def environment_tags() -> dict[str, str]:
     return tags
 
 
+def resolve_tracking_uri(tracking_uri: str | None = None) -> str:
+    """An explicit URI, else MLFLOW_TRACKING_URI, else this repo's mlflow.db."""
+    return tracking_uri or os.environ.get("MLFLOW_TRACKING_URI") or DEFAULT_TRACKING_URI
+
+
 def setup(experiment: str = DEFAULT_EXPERIMENT, tracking_uri: str | None = None) -> None:
     """Point MLflow at its store.
 
-    Defaults to a local ./mlruns directory. Set MLFLOW_TRACKING_URI to push to a
-    shared server without touching this code.
+    Defaults to `mlflow.db` at the repository root. Set MLFLOW_TRACKING_URI, or
+    pass --tracking-uri, to push to a shared server without touching this code.
     """
-    uri = tracking_uri or os.environ.get("MLFLOW_TRACKING_URI")
-    if uri:
-        mlflow.set_tracking_uri(uri)
+    mlflow.set_tracking_uri(resolve_tracking_uri(tracking_uri))
     mlflow.set_experiment(experiment)
 
 

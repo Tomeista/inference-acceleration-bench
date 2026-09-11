@@ -7,9 +7,8 @@ them across its own window instead of reading them once.
 
 Everything above the "Prometheus scraping" divider is engine-agnostic: it works
 off the per-request records the client returns and knows nothing about what
-served them. Below the divider, engine differences are confined to a
-`MetricsDialect`, which is how the sibling `ladder/` study measures llama.cpp
-with this same code.
+served them. Below the divider, the server's metric names are confined to a
+`MetricsDialect`, so a vLLM release that renames them is a one-table change.
 """
 
 from __future__ import annotations
@@ -152,11 +151,10 @@ _SAMPLE = re.compile(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?P<labels>\{[^}]*\})?
 class MetricsDialect:
     """The Prometheus names one serving engine happens to use.
 
-    vLLM and llama.cpp publish the same handful of facts under different names,
-    and each omits some the other has: llama.cpp does not preempt, vLLM has no
-    notion of a deferred slot. Naming the mapping once keeps everything below
-    engine-agnostic and, more importantly, keeps the "absent rather than zero"
-    convention in a single place. A metric this engine does not publish yields
+    The names have moved between vLLM releases, and a server without a draft
+    model publishes no speculative counters at all. Naming the mapping once
+    keeps everything below independent of those names and, more importantly,
+    keeps the "absent rather than zero" convention in a single place. A metric this engine does not publish yields
     no key at all, never a 0.0, because for acceptance rate and for preemptions
     the two readings mean opposite things.
 
@@ -308,10 +306,6 @@ class GaugeSampler:
     speculative config gets a *smaller* cache than its own baseline. Without
     this, the resulting preemptions would look like speculation being slow.
 
-    The GGUF ladder has the same hazard in a different shape: llama.cpp splits
-    one context across `--parallel` slots, so peak cache usage is what shows a
-    cell running against its per-slot ceiling.
-
     Sampling is best effort. A server without a /metrics endpoint, or one that
     is too busy to answer, yields no peaks rather than an error.
     """
@@ -387,8 +381,7 @@ def preemption_delta(
     sequences, which inflates tail latency for reasons unrelated to the config
     under test. It is a validity check on the run, not a result.
 
-    Absent on an engine that does not preempt. llama.cpp is one: it defers a
-    request until a slot frees rather than evicting a running one, so its
-    equivalent pressure signal is the queue-depth gauge instead.
+    Absent, rather than 0.0, when the server does not publish the counter:
+    0.0 would read as "checked, none happened", a claim nothing here made.
     """
     return counter_delta(before, after, dialect.preemptions, "preemptions")
