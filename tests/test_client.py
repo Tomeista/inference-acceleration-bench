@@ -40,6 +40,24 @@ def _scenarios(n: int, max_tokens: int = 8, turns: int = 1) -> list[Scenario]:
     return out
 
 
+def test_tool_requests_send_tool_choice_none():
+    """Tools render into the prompt, but the call must stream as plain content.
+
+    The implicit "auto" needs a vLLM tool-call parser, which buffers tokens until
+    it can name the function and ends the request at the call, so TTFT and
+    output length would stop measuring the engine.
+    """
+    tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+    turn = Turn(messages=[{"role": "user", "content": "hi"}], max_tokens=8,
+                temperature=0.0, tools=tools)
+    payload = turn.to_payload("qwen3-8b")
+    assert payload["tools"] == tools
+    assert payload["tool_choice"] == "none"
+
+    plain = Turn(messages=[{"role": "user", "content": "hi"}], max_tokens=8, temperature=0.0)
+    assert "tool_choice" not in plain.to_payload("qwen3-8b")
+
+
 async def test_records_a_successful_request(mock_server):
     result = await run_load(
         _scenarios(1, max_tokens=8),

@@ -42,6 +42,14 @@ class Turn:
             payload["stream_options"] = {"include_usage": True}
         if self.tools:
             payload["tools"] = self.tools
+            # "none", not the implicit "auto". The schemas still render into the
+            # prompt, so input length is what build_prompts measured, but the
+            # tool-call JSON streams back as ordinary content. Under "auto" vLLM
+            # needs a tool-call parser, and the parser buffers tokens until it can
+            # name the function (TTFT then measures the parser, p95 16 s on the
+            # GB10) and ends the request at the call regardless of ignore_eos, so
+            # output length is no longer pinned.
+            payload["tool_choice"] = "none"
         payload.update(self.extra_body)
         return payload
 
