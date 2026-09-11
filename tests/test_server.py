@@ -64,6 +64,17 @@ def test_sparsity_needs_no_serve_flags(configs):
     assert "spars" not in argv.lower()
 
 
+def test_server_env_is_exported_and_identical_across_configs(configs):
+    """The sampler switch changes kernels, so every config must carry the same env."""
+    envs = {config_id: tuple(sorted(c.env.items())) for config_id, c in configs.items()}
+    assert len(set(envs.values())) == 1, envs
+    for c in configs.values():
+        script = render_serve_script(c)
+        assert "export VLLM_USE_FLASHINFER_SAMPLER=0\n" in script
+        assert script.index("export ") < script.index("vllm serve")
+        assert c.as_params()["server_env"] == "VLLM_USE_FLASHINFER_SAMPLER=0"
+
+
 def test_speculative_config_is_shell_quoted(configs):
     script = render_serve_script(configs["fp8_eagle3"])
     assert "--speculative-config '{" in script

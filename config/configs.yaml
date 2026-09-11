@@ -30,6 +30,14 @@ defaults:
     # whichever config happened to run second. c7 will re-enable it
     # deliberately, as measuring reuse is the point of that class.
     - "--no-enable-prefix-caching"
+  env:
+    # The FlashInfer sampler hangs the vLLM 0.21 engine on the GB10 (sm_121)
+    # when a batch samples at temperature > 0: c2_longform at c=32 froze twice,
+    # 30 s and 5 min in, with 32 requests running and no further log output.
+    # With it off the same cell completes 128/128 at the same TPOT (87.4 vs
+    # 87.0 ms). Greedy classes never reach the sampler, so this only changes
+    # which kernel does top-k/top-p. Set for every config to keep them equal.
+    VLLM_USE_FLASHINFER_SAMPLER: "0"
 
 configs:
   # --- Quantization ladder -------------------------------------------------

@@ -58,6 +58,16 @@ def test_tool_requests_send_tool_choice_none():
     assert "tool_choice" not in plain.to_payload("qwen3-8b")
 
 
+def test_warmup_shortens_replies_without_touching_the_prompt_set():
+    from bench.run import WARMUP_MAX_TOKENS, shortened
+
+    original = _scenarios(2, max_tokens=1024)
+    short = shortened(original)
+    assert all(t.max_tokens == WARMUP_MAX_TOKENS for s in short for t in s.turns)
+    assert all(t.max_tokens == 1024 for s in original for t in s.turns)
+    assert [s.turns[0].messages for s in short] == [s.turns[0].messages for s in original]
+
+
 async def test_records_a_successful_request(mock_server):
     result = await run_load(
         _scenarios(1, max_tokens=8),

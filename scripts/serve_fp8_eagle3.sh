@@ -11,6 +11,7 @@
 # KV cache and get credited for it.
 set -euo pipefail
 
+export VLLM_USE_FLASHINFER_SAMPLER=0
 vllm serve ./models/Qwen3-8B-FP8-DYNAMIC \
     --served-model-name qwen3-8b \
     --host 0.0.0.0 \

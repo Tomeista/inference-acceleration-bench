@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import sys
 import time
@@ -24,10 +25,24 @@ from bench import metrics as metrics_mod
 from bench import tracking
 from bench.classes import REPO_ROOT, PromptClass, select_classes
 from bench.client import run_load, warmup
-from bench.scenarios import read_scenarios
+from bench.scenarios import Scenario, read_scenarios
 from bench.server import ServerConfig, load_configs, server_info, wait_for_ready, write_serve_scripts
 
 ARTIFACT_ROOT = REPO_ROOT / "results"
+
+
+WARMUP_PER_EXTRA_CLASS = 2
+WARMUP_MAX_TOKENS = 32
+
+
+def shortened(scenarios: list[Scenario], max_tokens: int = WARMUP_MAX_TOKENS) -> list[Scenario]:
+    """The same prompts with replies capped, for warmup only."""
+    return [
+        dataclasses.replace(
+            s, turns=[dataclasses.replace(t, max_tokens=min(t.max_tokens, max_tokens)) for t in s.turns]
+        )
+        for s in scenarios
+    ]
 
 
 def auto_requests(concurrency: int) -> int:
@@ -190,13 +205,28 @@ async def main_async(args: argparse.Namespace) -> int:
         )
 
     if args.warmup:
-        print(f"warmup      : {args.warmup} requests on {classes[0].id}")
+        print(
+            f"warmup      : {args.warmup} requests on {classes[0].id}"
+            + (f", {WARMUP_PER_EXTRA_CLASS} short on each other class" if len(classes) > 1 else "")
+        )
         await warmup(
             read_scenarios(classes[0].prompt_file),
             base_url=base_url,
             model=cfg.served_model_name,
             num_requests=args.warmup,
         )
+        # Every other class too. vLLM JIT-compiles some Triton kernels on first
+        # use, and a class can be the first to reach one (the top-k/top-p kernel
+        # on the first sampled batch, seen on the GB10); that one-off stall would
+        # otherwise land in the class's first measured request. Short replies
+        # are enough, since what compiles depends on the path, not the length.
+        for cls in classes[1:]:
+            await warmup(
+                shortened(read_scenarios(cls.prompt_file)),
+                base_url=base_url,
+                model=cfg.served_model_name,
+                num_requests=WARMUP_PER_EXTRA_CLASS,
+            )
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     artifact_dir = ARTIFACT_ROOT / f"{cfg.id}-{stamp}"
