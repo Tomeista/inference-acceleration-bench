@@ -34,6 +34,22 @@ from typing import Any, Callable, Iterable, Mapping
 # turning a 250-item run into a megabyte of JSONL.
 TEXT_KEPT = 600
 
+# A longer reply keeps its opening and its end. The end is where a
+# chain-of-thought reply commits to its answer, and keeping only the opening
+# made every long CoT reply impossible to re-score after a scorer fix. Replies
+# up to TEXT_KEPT are stored whole, exactly as before.
+TEXT_KEPT_HEAD = 200
+TEXT_KEPT_TAIL = 800
+
+
+def clip_text(text: str) -> str:
+    if len(text) <= TEXT_KEPT:
+        return text
+    elided = len(text) - TEXT_KEPT_HEAD - TEXT_KEPT_TAIL
+    if elided <= 0:
+        return text
+    return f"{text[:TEXT_KEPT_HEAD]}\n[... {elided} chars elided ...]\n{text[-TEXT_KEPT_TAIL:]}"
+
 
 # --------------------------------------------------------------------------
 # extraction
@@ -74,9 +90,23 @@ _MC_BARE = re.compile(r"(?<![A-Za-z])([A-D])(?![A-Za-z])")
 #                      the conservative direction, since `unparseable_rate` is a
 #                      measurement and a wrong answer is not. "Answer: I" is
 #                      unaffected; only the unlabelled form loses that letter.
+#
+# The first narrowing must not reach past the end of the line. It once looked
+# across newlines and spaces alike, so "Answer: C\nExplanation: A is wrong"
+# lost its label, and the bare fallback then returned the LAST letter in the
+# explanation -- a distractor, scored as the model's answer. Two labelled forms
+# now, and the last labelled match of either wins:
+#
+#   strict  the letter ends its line or is followed by punctuation
+#   loose   "Answer: C because ...": a word may follow, but only an uppercase
+#           letter other than I is accepted, which is what keeps "the answer
+#           is a bit" and "the answer is I think" unparseable
 _MC10_LABELLED = re.compile(
-    r"answer\s*(?:is\s*)?[:\-]?\s*\**\s*\(?\s*([A-Ja-j])(?!\s*[A-Za-z])\s*[\)\.\:,]?",
+    r"answer\s*(?:is\s*)?[:\-]?\s*\**\s*\(?\s*([A-Ja-j])(?![ \t]*[A-Za-z])\s*[\)\.\:,]?",
     re.IGNORECASE,
+)
+_MC10_LABELLED_LOOSE = re.compile(
+    r"(?i:answer)\s*(?:(?i:is)\s*)?[:\-]?\s*\**\s*\(?\s*([A-HJ])(?![A-Za-z])"
 )
 
 _MC10_BARE = re.compile(r"(?<![A-Za-z])([A-HJ])(?![A-Za-z])")
@@ -113,9 +143,9 @@ def extract_mc10(text: str) -> str | None:
     """
     if not text:
         return None
-    matches = _MC10_LABELLED.findall(text)
-    if matches:
-        return matches[-1].upper()
+    labelled = [*_MC10_LABELLED.finditer(text), *_MC10_LABELLED_LOOSE.finditer(text)]
+    if labelled:
+        return max(labelled, key=lambda m: m.start()).group(1).upper()
     bare = _MC10_BARE.findall(text)
     if bare:
         return bare[-1]
@@ -339,7 +369,7 @@ class ItemResult:
             "finish_reason": self.finish_reason,
             "truncated": self.truncated,
             "repetition": round(self.repetition, 4),
-            "text": self.text[:TEXT_KEPT],
+            "text": clip_text(self.text),
         }
         # Omitted when empty, so the items files the original three suites
         # write -- and which later runs read back as the reference -- stay

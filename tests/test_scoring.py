@@ -137,6 +137,25 @@ def test_narrowing_the_fallback_does_not_cost_the_letter_outright():
     assert extract_mc10("The answer is (I).") == "I"
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Answer: C\nExplanation: Option A is wrong.", "C"),
+        ("Answer: C because option B fails.", "C"),
+        ("The answer is D since E and F are wrong.", "D"),
+        ("**Answer: G**\n\nOptions H and J do not apply.", "G"),
+    ],
+)
+def test_a_labelled_answer_followed_by_prose_keeps_its_letter(text, expected):
+    """The labelled letter, not the last distractor the explanation names.
+
+    The narrowing above once looked across newlines, so a label followed by any
+    explanation was dropped and the bare fallback returned the explanation's
+    last letter -- a wrong option, scored as the model's answer.
+    """
+    assert extract_mc10(text) == expected
+
+
 # --------------------------------------------------------------------------
 # numeric
 # --------------------------------------------------------------------------
@@ -540,3 +559,15 @@ def test_a_loop_inside_the_reasoning_still_counts_as_repetition():
     loop = "the same clause over and over " * 20
     records = [FakeRecord("s0", f"<think>{loop}</think>Answer: A")]
     assert score_records(records, {"s0": "A"}, "mc")[0].repetition > 0.8
+
+
+def test_a_long_reply_keeps_its_end_where_the_answer_is():
+    from bench.scoring import TEXT_KEPT, clip_text
+
+    short = "x" * TEXT_KEPT
+    assert clip_text(short) == short
+    long = "start " + "y" * 5000 + " Answer: J"
+    clipped = clip_text(long)
+    assert clipped.startswith("start ")
+    assert clipped.endswith("Answer: J")
+    assert extract_mc10(clipped) == "J"
