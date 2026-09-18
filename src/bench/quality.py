@@ -433,6 +433,21 @@ async def main_async(args: argparse.Namespace) -> int:
     requested = [s.strip() for s in args.suites.split(",") if s.strip()]
     suites = select_suites(requested)
 
+    # A config lists the serve profiles it is scored under, and a suite runs
+    # only on configs that list its profile. That is what keeps bfcl_ast to the
+    # four core configs: the others have no `tools` server by design.
+    outside = [s.id for s in suites if s.profile not in cfg.profiles]
+    if outside:
+        if requested:
+            print(
+                f"cannot run {', '.join(outside)} on {cfg.id}: it needs a serve "
+                f"profile {cfg.id} does not list ({cfg.profiles}) in config/configs.yaml",
+                file=sys.stderr,
+            )
+            return 2
+        suites = [s for s in suites if s.id not in outside]
+        print(f"not scored on {cfg.id} by design: {', '.join(outside)}", file=sys.stderr)
+
     for suite in suites:
         if problem := check_context_budget(
             cfg, args.concurrency, PROMPT_BUDGET + suite.max_tokens

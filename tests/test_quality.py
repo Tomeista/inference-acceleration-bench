@@ -804,3 +804,24 @@ async def test_a_default_selection_skips_what_the_server_cannot_run(
     assert "skipping bfcl_ast" in out.err
     assert "scoring bfcl_ast" not in out.out
     assert "scoring mmlu__" in out.out
+
+
+def test_bfcl_is_scored_on_the_four_core_configs_only(configs):
+    """bfcl_ast runs under `tools`, and only the core configs list it."""
+    suite = select_suites(["bfcl_ast"])[0]
+    scored = {c.id for c in configs.values() if suite.profile in c.profiles}
+    assert scored == {"baseline_bf16", "fp8_dynamic", "w4a16_gptq", "fp8_fp8kv"}
+
+
+async def test_a_suite_outside_the_configs_profiles_is_refused(args, capsys):
+    args.config_id = "sparse24_bf16"
+    args.dry_run = True
+    args.suites = "bfcl_ast"
+    assert await quality_mod.main_async(args) == 2
+
+    # A default selection drops it by name and runs the rest.
+    args.suites = ""
+    assert await quality_mod.main_async(args) == 0
+    out = capsys.readouterr()
+    assert "not scored on sparse24_bf16 by design: bfcl_ast" in out.err
+    assert "would score bfcl_ast" not in out.out

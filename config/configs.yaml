@@ -49,6 +49,10 @@ configs:
     quant_method: none
     bit_width: "16"
     quality: true
+    # Scores bfcl_ast. Only the four core configs carry `tools`, which is what
+    # restricts the suite to them: bench.quality runs a suite only on configs
+    # that list its profile.
+    profiles: [base, tools]
 
   - id: fp8_dynamic
     name: Qwen3-8B FP8 W8A8 dynamic
@@ -60,6 +64,23 @@ configs:
     quant_method: fp8_dynamic
     bit_width: "8"
     quality: true
+    profiles: [base, tools]  # bfcl_ast; see baseline_bf16
+
+  # The KV-cache arm: fp8_dynamic's weights with an FP8 KV cache, so the only
+  # difference from fp8_dynamic is the cache. Built on one weight config
+  # rather than all three because it exists to isolate that one effect.
+  # Confirm `--kv-cache-dtype fp8` starts on the GB10 (sm_121) against this
+  # compressed-tensors checkpoint, and note which KV scales it reports, before
+  # trusting a cell.
+  - id: fp8_fp8kv
+    name: Qwen3-8B FP8 W8A8 dynamic + FP8 KV cache
+    model_path: ./models/Qwen3-8B-FP8-DYNAMIC
+    served_model_name: qwen3-8b
+    quant_method: fp8_dynamic
+    bit_width: "8"
+    kv_cache_dtype: fp8
+    quality: true
+    profiles: [base, tools]  # bfcl_ast; see baseline_bf16
 
   # --- Sparsity 2x2: {dense, 2:4} x {BF16, W4A16} --------------------------
   #
@@ -79,6 +100,7 @@ configs:
     quant_method: gptq
     bit_width: "4"
     quality: true
+    profiles: [base, tools]  # bfcl_ast; see baseline_bf16
 
   - id: sparse24_bf16
     name: Qwen3-8B 2:4 sparse, BF16
