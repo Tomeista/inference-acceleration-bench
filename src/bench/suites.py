@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -33,6 +33,18 @@ EVALS_DIR = REPO_ROOT / "evals"
 MANIFEST_PATH = EVALS_DIR / "manifest.json"
 
 
+# How a suite's items came to exist. The reproducibility claim is the same in
+# all three cases -- a rebuild reproduces the committed bytes or fails loudly --
+# but what has to be pinned to make that true differs.
+#
+#   huggingface  a dataset repo, a commit, a file inside it
+#   repository   a git repo, a commit, a path inside it. The Gorilla data files
+#                are not on the Hub
+#   synthetic    no upstream to pin. Generated here, so the pin is the generator
+#                name, the build seed, and a digest of the corpus it drew from
+PROVENANCE = ("huggingface", "repository", "synthetic")
+
+
 @dataclass(frozen=True)
 class Suite:
     """One benchmark, frozen: which items, how they are asked, how scored."""
@@ -40,16 +52,68 @@ class Suite:
     id: str
     name: str
     source: str
-    dataset: str
-    revision: str
-    parquet: str
     max_tokens: int
     scorer: str
+
+    # -- provenance -------------------------------------------------------
+    # `dataset`/`revision`/`parquet` read as "source, pin, path within source"
+    # and carry both fetched kinds: an HF dataset id or a git URL, a 40-hex
+    # commit either way, and the file inside. Reusing them rather than adding a
+    # parallel set is deliberate -- the reproducibility check is identical, and
+    # two near-identical field triples would drift apart.
+    provenance: str = "huggingface"
+    dataset: str = ""
+    revision: str = ""
+    parquet: str = ""
+    # Synthetic suites only. `generator` names the function that emitted the
+    # items; `corpus_digest` pins the material it drew from, because a suite
+    # generated at a fixed seed from changed source text is a changed suite.
+    generator: str = ""
+    corpus_digest: str = ""
+    # Further files the builder fetches beside `parquet`, relative to the same
+    # pinned commit. BFCL is split across a file per category plus a separate
+    # answer key for each, and a suite that fetches seven files must record
+    # seven paths or its provenance is a third of the truth.
+    extra_sources: list[str] = field(default_factory=list)
+
+    # -- how it is asked --------------------------------------------------
+    # The serve profile this suite requires. `bench.quality` refuses to score a
+    # suite against a server that is not running it, the same class of guard as
+    # the served_model_name check: a complete, plausible, mislabelled result is
+    # worse than a failure.
+    profile: str = "base"
     description: str = ""
     license: str = ""
     temperature: float = 0.0
+    # Sampling, flat rather than a nested dict so the dataclass stays frozen and
+    # hashable. The defaults are greedy, which is what every suite but the
+    # thinking arm wants: two configs must differ because their weights differ,
+    # not because their samplers rolled apart.
+    top_k: int = 1
+    top_p: float | None = None
+    thinking: bool = False
+    # Only the thinking arm sets this above 1. Everything else is greedy, and a
+    # second greedy pass would measure batch-composition nondeterminism -- which
+    # the noise-floor protocol measures deliberately instead, via --suffix.
+    seeds: int = 1
     n_items: int = 250
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.provenance not in PROVENANCE:
+            raise ValueError(
+                f"suite {self.id!r}: provenance {self.provenance!r} is not one of "
+                f"{list(PROVENANCE)}"
+            )
+        if self.provenance == "synthetic":
+            if not self.generator:
+                raise ValueError(f"suite {self.id!r} is synthetic but names no generator")
+        elif len(self.revision) != 40:
+            raise ValueError(
+                f"suite {self.id!r} is {self.provenance} but its revision "
+                f"{self.revision!r} is not a 40-character commit. A branch name "
+                f"would let the benchmark change underneath the study."
+            )
 
     @property
     def prompt_file(self) -> Path:
@@ -69,11 +133,20 @@ class Suite:
         return {
             "suite_id": self.id,
             "suite_source": self.source,
+            "provenance": self.provenance,
             "dataset": self.dataset,
             "dataset_revision": self.revision,
+            "extra_sources": ",".join(self.extra_sources) or "none",
+            "generator": self.generator,
+            "corpus_digest": self.corpus_digest,
             "n_items": self.n_items,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "thinking": self.thinking,
+            "seeds": self.seeds,
+            "serve_profile": self.profile,
             "scorer": self.scorer,
         }
 
@@ -144,19 +217,30 @@ def check_digests(suite: Suite) -> None:
             )
 
 
-def read_key(suite: Suite) -> dict[str, str]:
-    """scenario_id -> gold answer, already in the scorer's normalized form."""
-    answers: dict[str, str] = {}
+def read_key(suite: Suite) -> dict[str, dict]:
+    """scenario_id -> the whole key row.
+
+    The whole row rather than just `answer`, because a scorer is handed the row:
+    `answer` is the display string and the agreement join's gold, but a
+    structured suite's real gold data -- instruction specs, acceptable calls,
+    unit tests -- lives in `meta` and does not fit in a string.
+    """
+    rows: dict[str, dict] = {}
     with suite.key_file.open("r", encoding="utf-8") as fh:
         for line in fh:
             if not line.strip():
                 continue
             row = json.loads(line)
-            answers[row["scenario_id"]] = row["answer"]
-    return answers
+            rows[row["scenario_id"]] = row
+    return rows
 
 
-def load_suite(suite: Suite, *, verify: bool = True) -> tuple[list[Scenario], dict[str, str]]:
+def read_answers(suite: Suite) -> dict[str, str]:
+    """scenario_id -> gold answer only, for callers that want the string."""
+    return {sid: row["answer"] for sid, row in read_key(suite).items()}
+
+
+def load_suite(suite: Suite, *, verify: bool = True) -> tuple[list[Scenario], dict[str, dict]]:
     """The items and their answers, checked against each other.
 
     The check is the point. Two files that have drifted apart still load, still

@@ -210,6 +210,32 @@ async def run_suite(
     if reference_path != out_path:
         reference = read_reference(reference_path)
         reference_meta = read_meta(reference_path)
+
+        # The join below is keyed on scenario_id alone, and the suites are
+        # global, so a reference produced by a *different model* matches at full
+        # overlap: no missing items, no stale-manifest warning, and an
+        # agreement_with_reference that silently means "how often these two
+        # unrelated models agree" instead of "what compression cost this one".
+        #
+        # served_model_name is the right discriminator, not model_path:
+        # compression variants of one model deliberately have different paths
+        # (Qwen/Qwen3-8B vs ./models/Qwen3-8B-FP8-DYNAMIC) but share a served
+        # name, while two model families share neither. Refuse rather than warn
+        # -- unlike a stale manifest, there is no sense in which this number is
+        # still partly sound.
+        recorded_model = reference_meta.get("served_model_name")
+        if reference and recorded_model is not None and recorded_model != cfg.served_model_name:
+            print(
+                f"  refusing to score: the reference answers in "
+                f"{reference_path.name} were produced by served model "
+                f"{recorded_model!r}, but {cfg.id!r} serves "
+                f"{cfg.served_model_name!r}. These are different models, so "
+                f"agreement between them is not a quantization-damage metric. "
+                f"Pass --reference <a config serving {cfg.served_model_name}>.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
         recorded = reference_meta.get("eval_manifest")
         # A reference built against different eval bytes is comparing answers
         # to different questions. Warn rather than refuse: the accuracy in this
@@ -239,6 +265,11 @@ async def run_suite(
         results,
         {
             "config_id": cfg.id,
+            # Which model produced these answers, so the next config to join
+            # against them can tell whether that join means anything. config_id
+            # alone cannot: it is the thing the caller already chose.
+            "served_model_name": cfg.served_model_name,
+            "model_path": cfg.model_path,
             "suite_id": suite.id,
             "concurrency": args.concurrency,
             "suffix": args.suffix,
@@ -251,6 +282,13 @@ async def run_suite(
     notes = {
         "finish_reasons": sorted({r.finish_reason or "none" for r in results}),
         "reference": args.reference,
+        # Whether this cell was *supposed* to produce a paired agreement -- it is
+        # every config but the reference itself. Distinct from
+        # `reference_available`, which says whether it actually did: the gap
+        # between the two is a reference run that is missing or has drifted, and
+        # without recording the intent an absent agreement column is
+        # indistinguishable from a cell that never needed one.
+        "agreement_expected": reference_path != out_path,
         "reference_available": "agreement_with_reference" in values,
         "reference_stale": stale_reference,
         # Repo-relative when it sits under the repo, absolute otherwise: the
@@ -476,6 +514,15 @@ async def main_async(args: argparse.Namespace) -> int:
                         [r.to_dict() for r in results],
                         artifact_dir,
                         cell_id,
+                        # Every config but the reference is meant to carry a
+                        # paired agreement. Its absence means the reference run
+                        # is missing or scored different bytes, which is a
+                        # broken comparison rather than a cell with less to say.
+                        expected=(
+                            ("agreement_with_reference",)
+                            if notes.get("agreement_expected")
+                            else ()
+                        ),
                     )
 
     print("\nsummary")

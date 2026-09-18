@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Mapping
 
 # How much generated text to keep per item in the artifact. Enough to see why an
 # extraction failed -- the whole reason the raw text is kept at all -- without
@@ -164,6 +164,114 @@ EXTRACTORS: dict[str, Callable[[str], str | None]] = {
 
 
 # --------------------------------------------------------------------------
+# the scorer contract
+# --------------------------------------------------------------------------
+#
+# The three extractors above share a shape that the first three suites happened
+# to have: read one string out of the reply, and be correct if it equals one
+# gold string. Most of what the capability suite adds does not fit it.
+#
+#   ifeval      an item carries a list of instruction specs, and correctness is
+#               per-instruction as well as per-prompt
+#   bfcl_ast    the key is a set of acceptable calls, matched with type
+#               coercion and optional-parameter rules
+#   ruler       multi-needle items take partial credit
+#   evalplus    correctness is "the test suite passed"
+#   xstest      correctness is a refusal classification, not an answer
+#
+# So a scorer is given the whole key row and returns a verdict rather than a
+# string. `extracted` survives as a field because it is what `agreement` joins
+# on, and the paired agreement metric is the one this study leads with: for
+# bfcl it is the canonicalized call, for ruler the extracted needle, for xstest
+# the refusal label.
+#
+# `extra` is where a suite puts the metrics only it has. Two aggregation rules,
+# by naming convention, because per-item means are wrong for some of them:
+#
+#   plain name        averaged over items. A 0/1 value therefore aggregates to
+#                     a rate, which is what structure_failure and the rest want.
+#   `<n>_num`/`<n>_den`  summed separately and divided, giving `<n>`. IFEval's
+#                     instruction-level accuracy is a ratio of sums -- items
+#                     carry different numbers of instructions, and a mean of
+#                     per-item ratios would weight a one-instruction item as
+#                     heavily as a five-instruction one.
+
+
+@dataclass(frozen=True)
+class ScoreResult:
+    """What one scorer made of one reply."""
+
+    extracted: str | None
+    correct: bool
+    extra: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Reply:
+    """What the model sent back, as much of it as a scorer can need.
+
+    A dataclass rather than a bare string because of native function calling.
+    Under `--enable-auto-tool-choice` a tool call does not arrive as content at
+    all: vLLM's parser decodes it and it comes back in `tool_calls`, leaving
+    `text` empty. A scorer handed only the text would see nothing and score
+    every successful tool call as a failure to answer.
+
+    The pair is also exactly what separates BFCL's two failure modes. Calls
+    decoded means the model produced well-formed JSON and the question is
+    whether it was the *right* call; no calls but text present means the parser
+    could not decode what it emitted, which is a structure failure. One field
+    cannot express that difference.
+    """
+
+    text: str
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    finish_reason: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == "length"
+
+
+# reply, key row -> verdict. The key row is the whole line from
+# `<suite>.key.jsonl`, so a scorer reaches its structured gold data through
+# `row["meta"]` while `row["answer"]` stays the display string every suite has.
+Scorer = Callable[[Reply, Mapping[str, Any]], ScoreResult]
+
+
+def _from_extractor(extract: Callable[[str], str | None]) -> Scorer:
+    """Lift one of the original string extractors into the general contract.
+
+    Keeps `mc`, `mc10` and `numeric` scoring exactly what they scored before:
+    the equality test below is the one `score_records` used to inline, so the
+    committed eval sets produce byte-identical results across this change.
+    """
+
+    def score(reply: Reply, key: Mapping[str, Any]) -> ScoreResult:
+        extracted = extract(reply.text)
+        expected = key["answer"]
+        return ScoreResult(
+            extracted=extracted,
+            correct=extracted is not None and extracted == expected,
+        )
+
+    return score
+
+
+SCORERS: dict[str, Scorer] = {name: _from_extractor(fn) for name, fn in EXTRACTORS.items()}
+
+
+def register_scorer(name: str, scorer: Scorer) -> None:
+    """Add a scorer. Refuses to shadow an existing one.
+
+    A silently replaced scorer would rescore a suite under the same name, and
+    the MLflow store would hold two incomparable columns both called accuracy.
+    """
+    if name in SCORERS:
+        raise KeyError(f"scorer {name!r} is already registered")
+    SCORERS[name] = scorer
+
+
+# --------------------------------------------------------------------------
 # degeneracy and uncertainty
 # --------------------------------------------------------------------------
 
@@ -220,9 +328,10 @@ class ItemResult:
     truncated: bool
     repetition: float
     text: str
+    extra: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "scenario_id": self.scenario_id,
             "expected": self.expected,
             "extracted": self.extracted,
@@ -232,10 +341,88 @@ class ItemResult:
             "repetition": round(self.repetition, 4),
             "text": self.text[:TEXT_KEPT],
         }
+        # Omitted when empty, so the items files the original three suites
+        # write -- and which later runs read back as the reference -- stay
+        # byte-identical across this change.
+        if self.extra:
+            out["extra"] = {k: round(v, 6) for k, v in sorted(self.extra.items())}
+        return out
+
+
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+
+
+def split_thinking(text: str) -> tuple[str, str, bool]:
+    """(thinking, answer, unterminated) for a reply that may carry a think block.
+
+    Three cases, and the third is the one that matters.
+
+      no block            ("", text, False). Every non-thinking suite.
+      closed block        the reasoning, then the answer after `</think>`.
+      block never closed  (everything, "", True) -- the model ran out of budget
+                          mid-thought. The answer is *empty*, not "whatever the
+                          reasoning happened to say last".
+
+    That last case is why this returns a flag rather than just stripping. A
+    truncated thinking trace often ends mid-derivation on a number or a letter,
+    and scoring the reasoning text would read that as the model's answer: a
+    config that thinks itself out of budget would score at chance instead of
+    showing up as unparseable, which is the measurement the thinking arm is for.
+
+    Only the *first* block is treated as reasoning. Qwen3 emits one; a second
+    `<think>` inside the answer is content, and consuming it would silently
+    delete part of a reply.
+    """
+    start = text.find(THINK_OPEN)
+    if start == -1:
+        # A reply that closes a block it never opened: vLLM's chat template can
+        # emit the opening tag itself, so the model's text begins mid-thought.
+        close = text.find(THINK_CLOSE)
+        if close != -1:
+            return text[:close], text[close + len(THINK_CLOSE) :], False
+        return "", text, False
+
+    close = text.find(THINK_CLOSE, start)
+    if close == -1:
+        return text, "", True
+    return text[start + len(THINK_OPEN) : close], text[close + len(THINK_CLOSE) :], False
+
+
+def thinking_metrics(thinking: str, answer: str, unterminated: bool) -> dict[str, float]:
+    """Per-item cost of reasoning, in characters.
+
+    Characters rather than tokens, deliberately. The server reports
+    `completion_tokens` for the whole reply and does not split it at
+    `</think>`, so a per-part token count would have to be apportioned -- an
+    estimate presented in the same column as exact numbers. Characters are
+    exact, need no tokenizer, and answer the question the arm exists to ask:
+    whether a quantized config reasons for longer to reach the same answer.
+    Report them beside the exact `completion_tokens` mean the cell already logs.
+    """
+    if not thinking and not unterminated:
+        return {}
+    total = len(thinking) + len(answer)
+    return {
+        "thinking_chars": float(len(thinking)),
+        "answer_chars": float(len(answer)),
+        "thinking_share": len(thinking) / total if total else 0.0,
+        "thinking_unterminated": 1.0 if unterminated else 0.0,
+    }
+
+
+def _as_row(value: Any) -> Mapping[str, Any]:
+    """A key entry as a row.
+
+    `read_key` yields whole rows, but a bare gold string is the degenerate case
+    of the same thing and several tests write keys that way. Normalizing here
+    rather than at every call site keeps the scorer contract single-shaped.
+    """
+    return value if isinstance(value, Mapping) else {"answer": value}
 
 
 def score_records(
-    records: Iterable[Any], answers: dict[str, str], scorer: str
+    records: Iterable[Any], key: Mapping[str, Any], scorer: str
 ) -> list[ItemResult]:
     """Score the successful records of one suite against its answer key.
 
@@ -243,33 +430,59 @@ def score_records(
     iterable of anything with the right attributes rather than importing the
     class: it keeps this module free of the load client and therefore
     testable with two lines of fake.
+
+    `key` maps scenario_id to the row from `<suite>.key.jsonl`. The scorer sees
+    the whole row, because a structured suite's gold data does not fit in the
+    single `answer` string.
     """
-    if scorer not in EXTRACTORS:
-        raise KeyError(f"unknown scorer {scorer!r}; known: {sorted(EXTRACTORS)}")
-    extract = EXTRACTORS[scorer]
+    if scorer not in SCORERS:
+        raise KeyError(f"unknown scorer {scorer!r}; known: {sorted(SCORERS)}")
+    score = SCORERS[scorer]
 
     results: list[ItemResult] = []
     for record in records:
         if not record.success:
             continue
-        expected = answers.get(record.scenario_id)
-        if expected is None:
+        entry = key.get(record.scenario_id)
+        if entry is None:
             raise KeyError(
                 f"{record.scenario_id} was measured but is not in the answer key; "
                 f"the prompt file and the key file disagree"
             )
+        row = _as_row(entry)
         text = record.output_text or ""
-        extracted = extract(text)
+
+        # Applied to every suite, not only the thinking arm. On a non-thinking
+        # suite there is no block, so this is the identity -- and if a config
+        # starts emitting one anyway, that is a finding rather than something to
+        # be quietly scored as prose.
+        thinking, answer, unterminated = split_thinking(text)
+        reply = Reply(
+            text=answer,
+            # Structured calls, when native function calling decoded any. The
+            # tuple is empty on every suite that does not use tools, so a
+            # scorer that ignores it sees exactly what it saw before.
+            tool_calls=tuple(getattr(record, "tool_calls", ()) or ()),
+            finish_reason=record.finish_reason,
+        )
+        verdict = score(reply, row)
+        extra = dict(verdict.extra)
+        extra.update(thinking_metrics(thinking, answer, unterminated))
+
         results.append(
             ItemResult(
                 scenario_id=record.scenario_id,
-                expected=expected,
-                extracted=extracted,
-                correct=extracted is not None and extracted == expected,
+                expected=str(row["answer"]),
+                extracted=verdict.extracted,
+                correct=verdict.correct,
                 finish_reason=record.finish_reason,
                 truncated=record.finish_reason == "length",
+                # Over the whole reply, thinking included: a config that loops
+                # inside its reasoning is stuck, and scoring only the answer
+                # would hide the single clearest sign of a damaged checkpoint.
                 repetition=repetition_ratio(text),
                 text=text,
+                extra=extra,
             )
         )
     return results
@@ -307,6 +520,51 @@ def aggregate(results: list[ItemResult]) -> dict[str, float]:
     if scoreable:
         out["accuracy_parsed"] = sum(1 for r in scoreable if r.correct) / len(scoreable)
         out["n_scoreable"] = float(len(scoreable))
+    out.update(aggregate_extra(results))
+    return out
+
+
+def aggregate_extra(results: list[ItemResult]) -> dict[str, float]:
+    """Roll up the per-suite metrics in `ItemResult.extra`.
+
+    Two rules, chosen by name (see the scorer contract above):
+
+      `<n>_num` with `<n>_den`  summed separately, then divided. A ratio of
+                                sums, for metrics whose denominator varies per
+                                item -- IFEval items carry different numbers of
+                                instructions, and averaging per-item ratios
+                                would weight a one-instruction item as heavily
+                                as a five-instruction one.
+      anything else             averaged over the items that reported it.
+
+    Averaged over the items that *reported* it, not over every item: a metric
+    only some items can have (a needle depth that only multi-needle items
+    carry) must not be diluted by the items it does not apply to.
+    """
+    if not results:
+        return {}
+
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for result in results:
+        for name, value in result.extra.items():
+            totals[name] = totals.get(name, 0.0) + value
+            counts[name] = counts.get(name, 0) + 1
+
+    out: dict[str, float] = {}
+    for name in sorted(totals):
+        if name.endswith("_den"):
+            continue
+        if name.endswith("_num"):
+            stem = name[: -len("_num")]
+            den = totals.get(f"{stem}_den", 0.0)
+            # A zero denominator means no item carried the metric at all.
+            # Absent rather than zero, the same convention `agreement` follows:
+            # 0.0 would read as "measured, and it was nothing".
+            if den:
+                out[stem] = totals[name] / den
+            continue
+        out[name] = totals[name] / counts[name]
     return out
 
 
@@ -336,3 +594,73 @@ def agreement(
         "agreement_with_reference": same / len(shared),
         "agreement_n": float(len(shared)),
     }
+
+
+# --------------------------------------------------------------------------
+# suite scorers
+# --------------------------------------------------------------------------
+#
+# Registered here rather than in their own modules' import side effects, so
+# that the set of scorers a run can use is visible in one place and a suite
+# naming one that does not exist fails at load rather than mid-pass.
+
+
+def score_ifeval(reply: Reply, key: Mapping[str, Any]) -> ScoreResult:
+    """IFEval: four numbers per item, at two levels and two strictnesses.
+
+    `correct` is prompt-level strict -- every instruction on the item obeyed,
+    exactly as the reply came back. That is the headline and the harshest
+    reading; the other three travel in `extra`.
+
+    `extracted` is the per-instruction verdict pattern ("101"), not a pass/fail.
+    Two configs can fail the same item for opposite reasons, and pairing them on
+    a single bit would call that agreement. The pattern is what the agreement
+    join compares, so it is also what makes IFEval a sensitive paired metric
+    rather than a coarse one.
+    """
+    from bench.ifeval import evaluate, verdict_string
+
+    meta = key["meta"]
+    result = evaluate(meta["instruction_id_list"], meta["kwargs"], reply.text)
+    return ScoreResult(
+        extracted=verdict_string(result["strict_flags"]),
+        correct=bool(result["strict"]),
+        extra={
+            "prompt_loose": 1.0 if result["loose"] else 0.0,
+            "instruction_strict_num": float(result["n_strict_followed"]),
+            "instruction_strict_den": float(result["n_instructions"]),
+            "instruction_loose_num": float(result["n_loose_followed"]),
+            "instruction_loose_den": float(result["n_instructions"]),
+        },
+    )
+
+
+register_scorer("ifeval", score_ifeval)
+
+
+def score_bfcl_ast(reply: Reply, key: Mapping[str, Any]) -> ScoreResult:
+    """BFCL single-turn: the right call, with the right arguments.
+
+    The two failure rates travel in `extra` and are the point of the suite.
+    `structure_failure` is the model no longer producing a decodable call at
+    all; `semantic_failure` is a well-formed call that is wrong. They break the
+    integration in different ways and a merged accuracy hides which is which.
+
+    `extracted` is the canonical call signature, so the agreement join pairs two
+    configs on *what they called* rather than on whether each happened to be
+    right. Two configs can both be wrong and wrong differently.
+    """
+    from bench.bfcl import score_item
+
+    result = score_item(reply.tool_calls, reply.text, key["meta"].get("ground_truth"))
+    return ScoreResult(
+        extracted=result["extracted"],
+        correct=bool(result["correct"]),
+        extra={
+            "structure_failure": 1.0 if result["structure_failure"] else 0.0,
+            "semantic_failure": 1.0 if result["semantic_failure"] else 0.0,
+        },
+    )
+
+
+register_scorer("bfcl_ast", score_bfcl_ast)

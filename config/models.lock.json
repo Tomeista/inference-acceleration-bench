@@ -1,0 +1,173 @@
+{
+  "_comment": [
+    "Provenance record for checkpoints that are not downloadable by id.",
+    "",
+    ".gitignore excludes all of models/, so for a locally-produced or",
+    "externally-supplied checkpoint this file is the ONLY tracked evidence that",
+    "the artefact a measurement was taken on ever existed, and the only way to",
+    "prove months later that the bytes are the same ones. Same role that",
+    "models.lock.json plays in the ladder study, and that prompts/manifest.json",
+    "and evals/manifest.json play for the frozen input sets.",
+    "",
+    "Verify with:  cd <archive dir> && sha256sum -c qwen3-4b-dbbahn-sft-ep3.sha256"
+  ],
+  "checkpoints": [
+    {
+      "config_id": "dbbahn_bf16",
+      "name": "Qwen3-4B DB Bahn SFT, 3 epochs",
+      "recorded": "2026-09-14",
+      "supplied_by": "colleague; received already merged",
+      "base_model": "Qwen/Qwen3-4B",
+      "base_model_confidence": "INFERRED, NOT RECORDED. The directory carries no README, no training_args, no trainer_state and no adapter_config. The attribution rests on config.json matching Qwen3-4B exactly (hidden_size 2560, num_hidden_layers 36, num_attention_heads 32, num_key_value_heads 8, intermediate_size 9728, vocab_size 151936, tie_word_embeddings true, max_position_embeddings 40960, rope_theta 1000000) plus a byte-identical tokenizer. Treat as strong evidence, not as provenance.",
+      "training": "LoRA SFT on Deutsche Bahn domain data, 3 epochs. Adapters were merged into the weights before hand-over; no adapter_config.json is present, so rank, alpha and target_modules are NOT recoverable from this artefact.",
+      "frozen_original": "dell-gb10-1.dhbw.cloud:/home/tobiasm/qwen3-4b-dbbahn-sft-ep3  (chmod a-w, never served from, never written to again)",
+      "serving_copy": "dell-gb10-1.dhbw.cloud:/home/tobiasm/inference-acceleration-bench/models/qwen3-4b-dbbahn-sft-ep3",
+      "_why_two_locations": "The serve launchers bind-mount only the bench checkout into the vLLM container, so a model outside it cannot be served at all. The serving copy therefore lives under models/; the frozen original stays outside, read-only, as the artefact of record. Both verified identical against the manifest below.",
+      "sha256_manifest": "models/qwen3-4b-dbbahn-sft-ep3.sha256",
+      "derived": {
+        "dbbahn_fp8_eagle3": {
+          "path": "models/qwen3-4b-dbbahn-FP8-DYNAMIC",
+          "built": "2026-09-14",
+          "built_by": "quantization-cpu/quantize_qwen3_fp8.py --scheme FP8_DYNAMIC",
+          "quant_method": "compressed-tensors",
+          "format": "float-quantized",
+          "weights": "8-bit float, per channel",
+          "activations": "8-bit float, dynamic per token",
+          "ignore": [
+            "lm_head"
+          ],
+          "bytes": 4413908064,
+          "_note": "Data-free (llm-compressor inferred DataFreePipeline), so no calibration set is part of this checkpoint's provenance. Embeddings are tied in the source, and llm-compressor re-tied them after quantizing: 'Re-tied input/output embeddings; saving a single shared table.' Reproducible from the source above; not hashed here because it is derived, not received."
+        }
+      },
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "dtype": "bfloat16",
+      "tie_word_embeddings": true,
+      "transformers_version": "5.6.2",
+      "total_bytes": 8044997310,
+      "weight_bytes": 8044982000,
+      "n_params_derived": 4022491000,
+      "_n_params_note": "weight_bytes / 2 for bfloat16. Derived, not read from a config. Embeddings are tied, so there is no separate lm_head tensor to exclude.",
+      "files": {
+        "chat_template.jinja": {
+          "bytes": 4168,
+          "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+        },
+        "config.json": {
+          "bytes": 1592,
+          "sha256": "22ccbcc83d6c0c20a6cba7801fa39657fcd780729a354e9b006a4d62ba5eaf70"
+        },
+        "generation_config.json": {
+          "bytes": 213,
+          "sha256": "87ece18c3443a4eea18845d99a0f4d6d314cc23363c09b657138d206ddf2a75d"
+        },
+        "model-00001-of-00002.safetensors": {
+          "bytes": 4990818672,
+          "sha256": "6bfef5d78aa33a981248860a31028821558bd39443cdbd0be39317e182bceb64"
+        },
+        "model-00002-of-00002.safetensors": {
+          "bytes": 3054163328,
+          "sha256": "e167f448f237826e8178839a57baf0b42cd7721bcb18780e87bae6b942bcc675"
+        },
+        "model.safetensors.index.json": {
+          "bytes": 32855,
+          "sha256": "291af274b91a17c5b85cac516720831aa4858e46cf01f8a768f023a2fe97988e"
+        },
+        "tokenizer_config.json": {
+          "bytes": 694,
+          "sha256": "04b1682c59acbd057f4c9072297faa73d56fc9de053094c659cdb4c464f58f86"
+        },
+        "tokenizer.json": {
+          "bytes": 11422650,
+          "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506"
+        }
+      },
+      "prompt_set_compatibility": {
+        "verified": "2026-09-14",
+        "tokenizer_identical_to_prompt_builder": true,
+        "chat_template_identical_to_prompt_builder": true,
+        "compared_against": "quantization-cpu/Qwen3-0.6B-W8A16, the tokenizer recorded in prompts/manifest.json",
+        "tokenizer_sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506",
+        "chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+        "_note": "Both match byte for byte, so the frozen prompts/ and evals/ sets apply to this model UNCHANGED and its numbers sit on byte-identical inputs to the Qwen3-8B study. A local diff appeared to show 88 bytes of difference in the chat template; that was CRLF line endings in the Windows checkout, not content. Re-check both hashes before reusing the frozen sets on any future checkpoint."
+      }
+    },
+    {
+      "config_id": "qwen3_4b_bf16_eagle3 / qwen3_4b_fp8_eagle3",
+      "name": "Qwen3-4B stock, and the FP8 build derived from it",
+      "recorded": "2026-09-15",
+      "supplied_by": "Hugging Face (Qwen/Qwen3-4B), downloaded",
+      "base_model": "Qwen/Qwen3-4B",
+      "base_model_revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+      "base_model_confidence": "RECORDED, not inferred. Unlike the dbbahn entry this is a plain Hub download pinned to the snapshot revision above, so the BF16 arm needs no local record -- vLLM re-fetches it by id. Only the derived FP8 build below is untracked bytes, which is why this entry exists.",
+      "training": "none -- stock base model",
+      "_why_this_entry_exists": "These two configs are the fair-comparison arm for the FP8 accuracy claim. The 8B pair and the dbbahn pair differ in size, training AND suite at once, so 'FP8 costs the SFT model more' was not attributable to any of the three. Holding size and suite fixed and varying only the training makes the dbbahn pair and this pair a difference-in-differences.",
+      "derived": {
+        "qwen3_4b_fp8_eagle3": {
+          "path": "models/Qwen3-4B-FP8-DYNAMIC",
+          "built": "2026-09-15",
+          "built_by": "quantization-cpu/quantize_qwen3_fp8.py --model-id Qwen/Qwen3-4B --output-dir models/Qwen3-4B-FP8-DYNAMIC --device cpu",
+          "quant_method": "compressed-tensors",
+          "format": "float-quantized",
+          "weights": "8-bit float, per channel",
+          "activations": "8-bit float, dynamic per token",
+          "ignore": [
+            "lm_head"
+          ],
+          "bytes": 4413908064,
+          "_note": "THE SAME RECIPE, script and flags that produced the dbbahn FP8 build, which is what makes the two pairs comparable; a different scheme here would reintroduce the confound this arm exists to remove. Data-free (llm-compressor inferred DataFreePipeline), so no calibration set is part of its provenance. Embeddings are tied in the source and llm-compressor re-tied them after quantizing, so ignore=[lm_head] leaves the shared table unquantized -- same behaviour as the dbbahn build. Reproducible from the pinned revision above.",
+          "files": {
+            "chat_template.jinja": {
+              "bytes": 4168,
+              "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+            },
+            "config.json": {
+              "bytes": 2899,
+              "sha256": "a125400c3fec3ac78a76b9ba94dd8027c38d2a6486de8e97d59d258602888d2b"
+            },
+            "generation_config.json": {
+              "bytes": 214,
+              "sha256": "5292414bc5c987a1498cf50e6370ecf4939f451e023c74bb3facbdce8445a153"
+            },
+            "model.safetensors": {
+              "bytes": 4413908064,
+              "sha256": "469a795dfdd874e8f63901edbbd7ae63b625e0f36ebd522db6145aaaf35f7fa3"
+            },
+            "recipe.yaml": {
+              "bytes": 215,
+              "sha256": "2c5c08e18060ae771332046fea8a03a86f46071e78cbfebbd2fe25ee33915d03"
+            },
+            "tokenizer_config.json": {
+              "bytes": 694,
+              "sha256": "04b1682c59acbd057f4c9072297faa73d56fc9de053094c659cdb4c464f58f86"
+            },
+            "tokenizer.json": {
+              "bytes": 11422650,
+              "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506"
+            }
+          }
+        }
+      },
+      "draft_head": {
+        "path": "AngelSlim/Qwen3-4B_eagle3",
+        "num_speculative_tokens": 3,
+        "_note": "The SAME head the dbbahn pair uses, and carried by BOTH arms here so it cancels and FP8 is the only difference between them. Trained against stock Qwen3-4B, so on this pair it is on its home ground: the acceptance rate here is the matched-head ceiling that dbbahn's 0.20-0.28 was missing a comparison against."
+      },
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ],
+      "dtype": "bfloat16",
+      "tie_word_embeddings": true,
+      "prompt_set_compatibility": {
+        "verified": "2026-09-15",
+        "tokenizer_identical_to_prompt_builder": true,
+        "chat_template_identical_to_prompt_builder": true,
+        "tokenizer_sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506",
+        "chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+        "_note": "Both hashes match the dbbahn entry byte for byte, so all four 4B cells sit on byte-identical inputs. One trap worth recording: the Hub snapshot of Qwen/Qwen3-4B hashes DIFFERENTLY (tokenizer.json aeb13307a71acd8f, and it ships no chat_template.jinja at all -- the template lives inside tokenizer_config.json). That is save_pretrained re-serialising, not a content change, and it matters because the BF16 arm serves the Hub snapshot while the FP8 arm serves the re-serialised copy. Checked directly rather than assumed: all 250 mmlu_pro_cot prompts rendered through both tokenizers give identical strings AND identical token ids (lengths 62-1564). Compare token ids, not file hashes, on any future checkpoint."
+      }
+    }
+  ]
+}

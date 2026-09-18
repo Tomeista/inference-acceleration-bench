@@ -144,3 +144,167 @@ configs:
     spec_method: eagle3
     num_speculative_tokens: 3
     draft_model_path: RedHatAI/Qwen3-8B-speculator.eagle3
+
+  # --- Qwen3-4B DB Bahn SFT: before / after --------------------------------
+  #
+  # A second model family, not a rung on the ladder above. A domain-SFT'd
+  # Qwen3-4B (LoRA, merged before hand-over), measured before and after the
+  # acceleration treatment. Provenance and file hashes are in
+  # config/models.lock.json, which is the only tracked record of it: models/ is
+  # gitignored and the checkpoint carries no training metadata of its own.
+  #
+  # `served_model_name` is deliberately NOT qwen3-8b. bench.run and
+  # bench.quality only warn when a config's served name is *absent* from
+  # /v1/models, so sharing the 8B name would let either pass attach to the wrong
+  # running server and report a complete, plausible, mislabelled result.
+  #
+  # The frozen prompts/ and evals/ sets apply unchanged: this checkpoint's
+  # tokenizer.json and chat_template.jinja are byte-identical to the ones the
+  # sets were built against (verified 2026-09-14, hashes in models.lock.json).
+  #
+  # Scope is deliberately two configs -- before and after -- so note what that
+  # costs: dbbahn_fp8_eagle3 has NO matching non-speculative control. Its
+  # speedup over dbbahn_bf16 is quantization and speculation together and
+  # cannot be decomposed, and there is no 4B equivalent of RQ2. Adding a
+  # dbbahn_fp8 entry is all it would take to recover both.
+
+  # The control that separates two explanations of the same observation.
+  #
+  # dbbahn_bf16 truncated 52.8% of its mmlu_pro replies and left 44.4%
+  # unparseable, against 1.2% / ~0 for Qwen3-8B on byte-identical items. That
+  # was read as "the domain SFT eroded instruction-following" -- but the only
+  # comparison available differed in BOTH training AND size, so the 4B scale is
+  # an equally good explanation and nothing measured so far separates them.
+  #
+  # This is stock Qwen/Qwen3-4B: same size, same tokenizer, same chat template
+  # (both verified byte-identical to the SFT checkpoint), no fine-tuning. It
+  # pins the middle row:
+  #
+  #     Qwen3-8B base        1.2% truncated   (measured)
+  #     Qwen3-4B base        ?                <- this config
+  #     Qwen3-4B DB Bahn SFT 52.8% truncated  (measured)
+  #
+  # Low here => the SFT did it. High here => it is the model scale, and the
+  # finding belongs to 4B-class models generally rather than to this checkpoint.
+  #
+  # Not part of the acceleration study: it is never quantized and never paired
+  # with a draft model. It exists only to make the instruction-following claim
+  # attributable.
+  - id: qwen3_4b_base
+    name: Qwen3-4B stock (control for the DB Bahn SFT)
+    # HF id rather than a local path. NOTE: /data/hf_cache holds only this
+    # repo's config.json (16 MB, no safetensors), so the first server start
+    # downloads roughly 8 GB, unauthenticated. Set HF_TOKEN if it throttles.
+    model_path: Qwen/Qwen3-4B
+    served_model_name: qwen3-4b-base
+    quant_method: none
+    bit_width: "16"
+    quality: true
+
+  - id: dbbahn_bf16
+    name: Qwen3-4B DB Bahn SFT BF16
+    # Relative to the bench checkout, like every other config, and for a
+    # concrete reason: the serve launchers bind-mount ONLY the checkout into
+    # the vLLM container (-v "$BENCH:$BENCH" -w "$BENCH"). Anything outside it
+    # is invisible in there and the server simply never starts. The frozen
+    # original stays at ~/qwen3-4b-dbbahn-sft-ep3, chmod a-w; this is the
+    # serving copy, and models.lock.json carries the hashes that tie the two
+    # together. models/ is gitignored, which is why that lockfile exists.
+    model_path: ./models/qwen3-4b-dbbahn-sft-ep3
+    served_model_name: qwen3-4b-dbbahn
+    quant_method: none
+    bit_width: "16"
+    quality: true
+
+  - id: dbbahn_fp8_eagle3
+    name: Qwen3-4B DB Bahn SFT FP8 + EAGLE-3
+    model_path: ./models/qwen3-4b-dbbahn-FP8-DYNAMIC
+    served_model_name: qwen3-4b-dbbahn
+    quant_method: fp8_dynamic
+    bit_width: "8"
+    spec_method: eagle3
+    num_speculative_tokens: 3
+    # AngelSlim publishes the Qwen3 EAGLE-3 ladder that RedHat's stops short of
+    # (RedHat: 8B/14B/32B; AngelSlim: 1.7B/4B/14B/32B). 0.2B head, one decoder
+    # layer, draft_vocab_size 32000, hidden 2560 -- matching this target exactly.
+    # vLLM accepts the Eagle3LlamaForCausalLM format directly.
+    #
+    # Trained against STOCK Qwen3-4B, not against this SFT. Whether a
+    # base-model head survives domain SFT is the open question, and the
+    # acceptance column is what answers it. Sweep k over {2,3,4}: transfer loss
+    # shows up at depth and k=3 alone can hide it.
+    draft_model_path: AngelSlim/Qwen3-4B_eagle3
+
+  # --- Stock Qwen3-4B accelerated: the fair-comparison arm -----------------
+  #
+  # Why these two exist. The acceleration result so far rests on two pairs that
+  # are not comparable with each other:
+  #
+  #   Qwen3-8B    baseline_bf16 -> fp8_eagle3       small accuracy drop
+  #   Qwen3-4B    dbbahn_bf16   -> dbbahn_fp8_eagle3  ~5 points (McNemar p=0.031)
+  #
+  # and the two differ in THREE ways at once -- model size (8B vs 4B), training
+  # (stock vs three epochs of domain SFT), and suite (`mmlu_pro` at 16 tokens vs
+  # `mmlu_pro_cot` at 2048). Any of the three explains "the 4B lost more", so
+  # none of them is attributable. "FP8 hurts a domain-SFT'd model more" is the
+  # interesting reading and it is exactly the one the design cannot support.
+  #
+  # These two configs hold size and suite fixed and vary only the training:
+  # stock Qwen/Qwen3-4B, the same EAGLE-3 head, the same FP8_DYNAMIC recipe,
+  # scored on `mmlu_pro_cot`. Against the dbbahn pair that is a clean
+  # difference-in-differences -- same scale, same benchmark, same treatment,
+  # and the only thing left varying is the fine-tune.
+  #
+  # Both carry the draft head, unlike the dbbahn pair whose "before" has none.
+  # That is deliberate: it puts the EAGLE-3 head on BOTH sides so it cancels,
+  # leaving FP8 as the only difference between them. It costs nothing, because
+  # greedy EAGLE-3 is verified by the target and so answers what its verifier
+  # answers -- measured at agreement 1.000 on the 8B pair.
+  #
+  # `served_model_name: qwen3-4b-base` is shared with `qwen3_4b_base` above on
+  # purpose. quality.py joins the agreement comparison on that field and refuses
+  # a cross-model join, so sharing it is what lets these three cells be scored
+  # against each other -- and `qwen3_4b_base` (already measured at
+  # mmlu_pro_cot: acc 0.500, trunc 0.000) is then a free no-speculation control
+  # for the EAGLE-3 losslessness check. It is the same underlying model in all
+  # three, which is the sense in which that field is a model identity and not a
+  # config identity: the 8B configs likewise all serve as `qwen3-8b`.
+  #
+  # Neither is `quality: true`: they are speculative, so they sit outside the
+  # default quality subset by the same rule as bf16_eagle3 and fp8_eagle3, and
+  # are scored with --force.
+
+  - id: qwen3_4b_bf16_eagle3
+    name: Qwen3-4B stock BF16 + EAGLE-3
+    model_path: Qwen/Qwen3-4B
+    served_model_name: qwen3-4b-base
+    quant_method: none
+    bit_width: "16"
+    spec_method: eagle3
+    num_speculative_tokens: 3
+    # The SAME head the dbbahn pair uses, and here it is on its home ground:
+    # AngelSlim trained it against stock Qwen3-4B. So the acceptance rate in
+    # this row is the matched-head ceiling, and dbbahn_fp8_eagle3's acceptance
+    # (0.20-0.28) can finally be read against something -- the gap between them
+    # is what the domain SFT cost the draft head's transfer.
+    draft_model_path: AngelSlim/Qwen3-4B_eagle3
+
+  - id: qwen3_4b_fp8_eagle3
+    name: Qwen3-4B stock FP8 + EAGLE-3
+    # Produced by quantization-cpu/quantize_qwen3_fp8.py --model-id Qwen/Qwen3-4B,
+    # the identical data-free FP8_DYNAMIC recipe that produced the dbbahn FP8
+    # build. Same recipe on both sides is what makes the difference-in-
+    # differences legitimate; a different scheme here would reintroduce the
+    # confound the pair exists to remove.
+    #
+    # Note Qwen3-4B TIES its embeddings, unlike the 8B. `ignore=["lm_head"]`
+    # therefore does nothing on its own here -- llm-compressor re-ties the
+    # shared table on save. The output projection is left unquantized either
+    # way, so the recipe matches dbbahn's in effect as well as in name.
+    model_path: ./models/Qwen3-4B-FP8-DYNAMIC
+    served_model_name: qwen3-4b-base
+    quant_method: fp8_dynamic
+    bit_width: "8"
+    spec_method: eagle3
+    num_speculative_tokens: 3
+    draft_model_path: AngelSlim/Qwen3-4B_eagle3

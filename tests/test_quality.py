@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 from bench import quality as quality_mod
+from bench.build_evals import extra_body_for
 from bench.report import QUALITY_KEY, quality_problems, render_quality, select_cells
 from bench.server import check_context_budget, load_configs
 from bench.suites import (
@@ -24,6 +25,7 @@ from bench.suites import (
     digest,
     load_suite,
     load_suites,
+    read_key,
     select_suites,
 )
 
@@ -38,16 +40,6 @@ def suites():
 @pytest.fixture(scope="module")
 def configs():
     return load_configs()
-
-
-@pytest.fixture
-def args(tmp_path, monkeypatch):
-    """A parsed CLI with the items store redirected out of the repo."""
-    monkeypatch.setattr(quality_mod, "QUALITY_ROOT", tmp_path)
-    parsed = quality_mod.build_parser().parse_args([])
-    parsed.n_items = 8
-    parsed.concurrency = 2
-    return parsed
 
 
 # --------------------------------------------------------------------------
@@ -147,8 +139,15 @@ def test_no_quality_prompt_pins_output_length(suites):
 
 
 def test_every_quality_prompt_decodes_greedily(suites):
-    """Two configs must differ because their weights differ, not their samplers."""
+    """Two configs must differ because their weights differ, not their samplers.
+
+    The thinking arm is the deliberate exception and is checked separately
+    below: Qwen warns that greedy decoding with thinking on can run away into
+    repetition, which would then be misread as quantization damage.
+    """
     for suite in suites.values():
+        if suite.thinking:
+            continue
         scenarios, _ = load_suite(suite)
         for scenario in scenarios:
             for turn in scenario.turns:
@@ -157,6 +156,54 @@ def test_every_quality_prompt_decodes_greedily(suites):
                 # Left on, Qwen3 reasons for as long as it likes and GSM8K's
                 # truncation rate becomes a property of the config's verbosity.
                 assert turn.extra_body["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_a_thinking_suite_samples_the_way_qwen_recommends(suites):
+    """The one place greedy is wrong, so it needs its own pin.
+
+    Qwen's model card gives temperature 0.6 / top-p 0.95 / top-k 20 for thinking
+    mode and explicitly warns against greedy there. A thinking suite left at
+    temperature 0 would produce endless repetition that looks exactly like a
+    damaged checkpoint, and `seeds` above 1 is what makes the resulting
+    stochasticity reportable as a mean rather than hidden in a single draw.
+    """
+    for suite in suites.values():
+        if not suite.thinking:
+            continue
+        assert suite.temperature == 0.6, f"{suite.id} is not at Qwen's thinking temperature"
+        assert suite.top_p == 0.95, f"{suite.id} does not set Qwen's thinking top-p"
+        assert suite.top_k == 20, f"{suite.id} does not set Qwen's thinking top-k"
+        assert suite.seeds > 1, f"{suite.id} samples but draws once; report a mean, not a draw"
+        scenarios, _ = load_suite(suite)
+        for scenario in scenarios:
+            for turn in scenario.turns:
+                assert turn.extra_body["chat_template_kwargs"]["enable_thinking"] is True
+
+
+def test_the_frozen_prompts_carry_the_sampling_their_suite_defines(suites):
+    """The offline stand-in for a rebuild, and it guards a real hazard.
+
+    `build_evals.extra_body_for` derives these pins from the suite's own fields
+    rather than from a module constant. That is what lets the thinking arm ask
+    for different sampling -- but it also means a future edit to that function,
+    or to a suite's sampling fields, silently describes prompts that are not the
+    ones on disk. Rebuilding would catch it; rebuilding needs the network, and
+    this check does not.
+    """
+    for suite in suites.values():
+        expected = extra_body_for(suite)
+        scenarios, _ = load_suite(suite)
+        for scenario in scenarios:
+            for turn in scenario.turns:
+                # Subset rather than equality: a suite may add keys of its
+                # own (bfcl_ast sets tool_choice), but every sampling pin the
+                # suite declares must be present and must have the declared value.
+                carried = {k: turn.extra_body.get(k) for k in expected}
+                assert carried == expected, (
+                    f"{suite.id} {scenario.scenario_id}: the frozen prompt carries "
+                    f"{carried}, but this suite now builds {expected}. "
+                    f"Rebuild the set and re-measure every config, or revert the change."
+                )
 
 
 def test_the_quality_subset_covers_every_weight_change(configs):
@@ -216,10 +263,10 @@ def test_unknown_key_in_a_suite_is_rejected(tmp_path):
 
 
 def test_every_suite_names_a_scorer_that_exists(suites):
-    from bench.scoring import EXTRACTORS
+    from bench.scoring import SCORERS
 
     for suite in suites.values():
-        assert suite.scorer in EXTRACTORS
+        assert suite.scorer in SCORERS
 
 
 def test_a_single_suite_can_be_run_on_its_own(suites):
@@ -261,17 +308,50 @@ def test_every_multiple_choice_gold_answer_is_offered_by_its_prompt(suites):
                 for line in prompt.splitlines()
                 if len(line) > 2 and line[0].isupper() and line[1] == "."
             }
-            gold = answers[scenario.scenario_id]
+            gold = answers[scenario.scenario_id]["answer"]
             assert gold in offered, (
                 f"{suite.id} {scenario.scenario_id}: key says {gold}, but the "
                 f"prompt offers {sorted(offered)}"
             )
 
 
-def test_every_suite_pins_a_dataset_commit(suites):
-    """`main` would let the benchmark change underneath the study."""
+def test_every_suite_pins_its_source(suites):
+    """`main` would let the benchmark change underneath the study.
+
+    Three provenance kinds, three things to pin. A fetched suite pins a commit;
+    a generated one has no upstream commit to pin, so what has to be fixed
+    instead is the generator and the corpus it drew from -- a suite generated
+    at a fixed seed from changed source text is a changed suite, and only the
+    corpus digest can see that.
+    """
     for suite in suites.values():
-        assert len(suite.revision) == 40, f"{suite.id} is not pinned to a commit"
+        if suite.provenance == "synthetic":
+            assert suite.generator, f"{suite.id} is synthetic but names no generator"
+            assert len(suite.corpus_digest) == 16, (
+                f"{suite.id} does not pin the corpus it was generated from"
+            )
+        else:
+            assert len(suite.revision) == 40, f"{suite.id} is not pinned to a commit"
+
+
+def test_a_suite_cannot_pin_its_source_to_a_branch(tmp_path):
+    """The guard is in the loader, not only in this test file: a suite added on
+    a branch pin must fail where it is defined, not silently measure."""
+    path = tmp_path / "suites.yaml"
+    path.write_text(
+        "suites:\n"
+        "  - id: drifty\n"
+        "    name: Pinned to a branch\n"
+        "    source: mmlu\n"
+        "    dataset: cais/mmlu\n"
+        "    revision: main\n"
+        "    parquet: all/test.parquet\n"
+        "    max_tokens: 16\n"
+        "    scorer: mc\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="not a 40-character commit"):
+        load_suites(path)
 
 
 def test_a_suite_records_itself_as_suite_id_not_class_id(suites):
@@ -597,3 +677,73 @@ def test_the_table_never_prints_accuracy_without_its_interval():
     body = [l for l in lines if "w4a16_gptq" in l]
     assert body and "0.700" in body[0]
     assert "[0.640, 0.760]" in body[0]
+
+
+# --------------------------------------------------------------------------
+# the German arm
+# --------------------------------------------------------------------------
+
+
+def test_the_german_and_english_mmlu_suites_are_item_matched(suites):
+    """The claim the whole German/English comparison rests on.
+
+    MMMLU is the same 14,042 MMLU items professionally translated in the same
+    row order, so the identical stratified draw must select the identical
+    questions. If a re-upload reorders either file, the two suites quietly
+    become independent 250-item samples of the same benchmark -- still valid
+    suites, still plausible numbers, but the English-German delta stops being
+    paired and at 250 items is then mostly noise. Nothing downstream could tell.
+    """
+    en = read_key(suites["mmlu"])
+    de = read_key(suites["mmlu_de"])
+    assert len(en) == len(de) == 250
+
+    for i in range(250):
+        english = en[f"mmlu-{i:04d}"]
+        german = de[f"mmlu_de-{i:04d}"]
+        assert english["meta"]["subject"] == german["meta"]["subject"], (
+            f"item {i}: {english['meta']['subject']} in English but "
+            f"{german['meta']['subject']} in German -- the sources have drifted "
+            f"out of row order and the two suites are no longer the same questions"
+        )
+
+
+def test_the_documented_gold_disagreements_are_still_only_a_handful(suites):
+    """MMMLU's key differs from MMLU's on a few items, and that is written down.
+
+    Left as the sources have them: each suite scores against its own published
+    key, every config meets the same key, so a wrong label subtracts equally
+    from all of them and cancels in the paired metric. What would matter is the
+    count changing -- that would mean a re-upload moved options rather than just
+    relabelling, and the two suites would no longer be asking the same thing.
+    """
+    en = read_key(suites["mmlu"])
+    de = read_key(suites["mmlu_de"])
+    differing = [
+        i
+        for i in range(250)
+        if en[f"mmlu-{i:04d}"]["answer"] != de[f"mmlu_de-{i:04d}"]["answer"]
+    ]
+    assert len(differing) <= 2, (
+        f"{len(differing)} of 250 drawn items disagree on the gold letter "
+        f"({differing}); the published rate is 5 in 14,042"
+    )
+
+
+def test_the_german_suites_ask_in_german(suites):
+    """A German capability slice must not be measured through an English scaffold.
+
+    Not a style preference: instruction-following in German is part of what
+    degrades, and an English answer-format line would measure the model's
+    English scaffolding on a German question. The confound this accepts is
+    documented in the suite description.
+    """
+    from bench.build_evals import BELEBELE_DE_INSTRUCTION, MMLU_DE_INSTRUCTION
+
+    for suite_id, instruction in (
+        ("mmlu_de", MMLU_DE_INSTRUCTION),
+        ("belebele_de", BELEBELE_DE_INSTRUCTION),
+    ):
+        scenarios, _ = load_suite(suites[suite_id])
+        for scenario in scenarios:
+            assert instruction in scenario.turns[0].messages[0]["content"]

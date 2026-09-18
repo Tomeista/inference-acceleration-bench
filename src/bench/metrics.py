@@ -187,12 +187,23 @@ VLLM = MetricsDialect(
         "vllm:num_preemptions_total",
     ),
     gauges=(
+        # BOTH spellings on purpose. vLLM renamed this gauge
+        # `gpu_cache_usage_perc` -> `kv_cache_usage_perc`, and the old name is
+        # what this study asked for through every run up to 2026-09-15. Because
+        # a missing metric yields no key rather than a 0.0 (see the dialect
+        # docstring), that silently produced an EMPTY kv_cache_usage_peak
+        # column in every speed cell ever recorded -- the report printed "-"
+        # and nothing anywhere said the name had moved. Asking for both keeps
+        # older servers working and makes the next rename survivable; they map
+        # to one reported name below, and a server publishes only one of them.
         "vllm:gpu_cache_usage_perc",
+        "vllm:kv_cache_usage_perc",
         "vllm:num_requests_running",
         "vllm:num_requests_waiting",
     ),
     gauge_names={
         "vllm:gpu_cache_usage_perc": "kv_cache_usage_peak",
+        "vllm:kv_cache_usage_perc": "kv_cache_usage_peak",
         "vllm:num_requests_running": "requests_running_peak",
         "vllm:num_requests_waiting": "requests_waiting_peak",
     },
@@ -253,6 +264,24 @@ def counter_delta(
     if not key or key not in after:
         return {}
     return {name: after.get(key, 0.0) - before.get(key, 0.0)}
+
+
+# Every metric a working speculative server produces. Named here rather than in
+# the caller so that the expectation and the producer cannot drift apart: adding
+# a key to `spec_decode_metrics` without adding it here means a cell can lose it
+# silently, which is the failure this list exists to make visible.
+#
+# All five are expected on any speculative config -- including the two that are
+# conditional inside the function. `spec_acceptance_rate` appears only when
+# draft tokens were produced, so its absence on a config that HAS a draft model
+# means the draft was never run, which is a finding rather than a nuance.
+SPEC_METRICS: tuple[str, ...] = (
+    "spec_drafts",
+    "spec_draft_tokens",
+    "spec_accepted_tokens",
+    "spec_acceptance_rate",
+    "spec_mean_accepted_length",
+)
 
 
 def spec_decode_metrics(
