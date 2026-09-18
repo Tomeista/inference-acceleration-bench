@@ -747,3 +747,60 @@ def test_the_german_suites_ask_in_german(suites):
         scenarios, _ = load_suite(suites[suite_id])
         for scenario in scenarios:
             assert instruction in scenario.turns[0].messages[0]["content"]
+
+
+async def test_a_reference_from_another_model_is_refused_before_generation(
+    mock_server, configs, args, monkeypatch
+):
+    """The check needs only the files on disk, so it must not cost a pass.
+
+    It used to run after every item had been generated, and the pass was then
+    thrown away.
+    """
+    monkeypatch.setenv("MOCK_REPLY", "Answer: C")
+    suite = select_suites(["mmlu"])[0]
+    await quality_mod.run_suite(suite, configs[REFERENCE], mock_server, args)
+
+    sidecar = quality_mod.meta_path(quality_mod.items_path(suite.id, REFERENCE))
+    meta = json.loads(sidecar.read_text())
+    meta["served_model_name"] = "some-other-model"
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    async def no_requests(*a, **kw):
+        raise AssertionError("generation ran before the reference was checked")
+
+    monkeypatch.setattr(quality_mod, "run_load", no_requests)
+    with pytest.raises(SystemExit):
+        await quality_mod.run_suite(suite, configs["w4a16_gptq"], mock_server, args)
+
+    args.config_id = "w4a16_gptq"
+    args.suites = "mmlu"
+    args.dry_run = True
+    assert await quality_mod.main_async(args) == 2
+
+
+async def test_a_suite_is_refused_on_a_server_without_its_profile(
+    mock_server, args, monkeypatch
+):
+    """BFCL against a base server answers 400 to every item; refuse up front."""
+    monkeypatch.setenv("MOCK_AUTO_TOOL_CHOICE", "0")
+    args.config_id = REFERENCE
+    args.server_url = mock_server
+    args.mlflow = False
+    args.suites = "bfcl_ast"
+    assert await quality_mod.main_async(args) == 2
+
+
+async def test_a_default_selection_skips_what_the_server_cannot_run(
+    mock_server, args, monkeypatch, capsys
+):
+    monkeypatch.setenv("MOCK_AUTO_TOOL_CHOICE", "0")
+    monkeypatch.setenv("MOCK_REPLY", "Answer: C")
+    args.config_id = REFERENCE
+    args.server_url = mock_server
+    args.mlflow = False
+    assert await quality_mod.main_async(args) == 0
+    out = capsys.readouterr()
+    assert "skipping bfcl_ast" in out.err
+    assert "scoring bfcl_ast" not in out.out
+    assert "scoring mmlu__" in out.out

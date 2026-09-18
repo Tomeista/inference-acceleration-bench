@@ -103,7 +103,10 @@ async def version() -> JSONResponse:
 
 @app.get("/v1/models")
 async def models() -> JSONResponse:
-    return JSONResponse({"data": [{"id": MODEL_NAME, "object": "model"}]})
+    max_model_len = int(os.environ.get("MOCK_MAX_MODEL_LEN", "16384"))
+    return JSONResponse(
+        {"data": [{"id": MODEL_NAME, "object": "model", "max_model_len": max_model_len}]}
+    )
 
 
 @app.get("/metrics")
@@ -157,6 +160,22 @@ async def chat_completions(request: Request):
     tools = body.get("tools")
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
     prompt_tokens = _estimate_prompt_tokens(messages, tools)
+
+    # vLLM refuses `tool_choice: "auto"` unless it was started with
+    # --enable-auto-tool-choice, which is how bench.server.probe_capabilities
+    # tells the `tools` profile apart. MOCK_AUTO_TOOL_CHOICE=0 plays a base
+    # server. Read per request, like MOCK_REPLY.
+    if tools and body.get("tool_choice") == "auto":
+        if os.environ.get("MOCK_AUTO_TOOL_CHOICE", "1") != "1":
+            return JSONResponse(
+                {"error": '"auto" tool choice requires --enable-auto-tool-choice'},
+                status_code=400,
+            )
+        if not body.get("stream"):
+            return JSONResponse(
+                {"choices": [{"index": 0, "message": {"role": "assistant", "content": ""},
+                              "finish_reason": "length"}]}
+            )
 
     # Filler always runs to max_tokens and finishes on length: ignore_eos is
     # what the speed sweep relies on for a fixed output length. A scripted

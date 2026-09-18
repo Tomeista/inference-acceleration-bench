@@ -355,6 +355,73 @@ def server_info(base_url: str) -> dict[str, Any]:
     return info
 
 
+def probe_capabilities(base_url: str, model: str) -> dict[str, Any]:
+    """What the running server can do, as far as the serve profiles differ.
+
+    A server does not report its launch flags, so each profile difference is
+    read off behaviour instead:
+
+      tools          a one-token request with `tool_choice: "auto"`. vLLM
+                     answers 400 unless it was started with
+                     --enable-auto-tool-choice and a parser. None when the
+                     probe could not tell either way.
+      max_model_len  as /v1/models reports it for `model`, or None.
+    """
+    base = base_url.rstrip("/")
+    caps: dict[str, Any] = {"tools": None, "max_model_len": None}
+    try:
+        for entry in httpx.get(base + "/v1/models", timeout=10.0).json().get("data", []):
+            if entry.get("id") == model and entry.get("max_model_len"):
+                caps["max_model_len"] = int(entry["max_model_len"])
+    except Exception:  # noqa: BLE001
+        pass
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "description": "Does nothing.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        "tool_choice": "auto",
+    }
+    try:
+        response = httpx.post(base + "/v1/chat/completions", json=payload, timeout=60.0)
+        if response.status_code == 200:
+            caps["tools"] = True
+        elif response.status_code == 400:
+            caps["tools"] = False
+    except Exception:  # noqa: BLE001
+        pass
+    return caps
+
+
+def profile_problem(profile_id: str, caps: dict[str, Any]) -> str | None:
+    """Why a server with `caps` cannot stand in for `profile_id`, or None.
+
+    Checks only what a suite needs from the profile. A `tools` server can
+    score a `base` suite -- requests without tools never reach the parser --
+    so this is "can it serve", not "is it exactly".
+    """
+    prof = get_profile(profile_id)
+    if "--enable-auto-tool-choice" in prof.extra_args and caps.get("tools") is not True:
+        state = "is off" if caps.get("tools") is False else "could not be confirmed"
+        return f"native tool calling {state}; start the server from its `{profile_id}` serve script"
+    if prof.max_model_len and (caps.get("max_model_len") or 0) < prof.max_model_len:
+        return (
+            f"server max_model_len is {caps.get('max_model_len')}, the `{profile_id}` "
+            f"profile needs {prof.max_model_len}"
+        )
+    return None
+
+
 def check_context_budget(cfg: ServerConfig, concurrency: int, longest_request: int) -> str | None:
     """Reasons this config cannot honestly run a cell, or None.
 

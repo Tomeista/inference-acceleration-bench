@@ -318,3 +318,29 @@ def test_every_config_emits_at_least_the_base_profile(configs):
         assert "base" in cfg.profiles, f"{cfg.id} would have no pinned serve script"
         for profile in cfg.profiles:
             assert profile in PROFILES, f"{cfg.id} names unknown profile {profile!r}"
+
+
+def test_the_tools_profile_needs_the_parser_confirmed():
+    from bench.server import profile_problem
+
+    assert profile_problem("tools", {"tools": True, "max_model_len": 16384}) is None
+    assert "is off" in profile_problem("tools", {"tools": False, "max_model_len": 16384})
+    assert "could not be confirmed" in profile_problem("tools", {"tools": None})
+    # A tools server can still score a base suite.
+    assert profile_problem("base", {"tools": True, "max_model_len": 16384}) is None
+
+
+def test_the_long_profile_needs_the_window():
+    from bench.server import profile_problem
+
+    assert "needs 32768" in profile_problem("long", {"tools": False, "max_model_len": 16384})
+    assert profile_problem("long", {"tools": False, "max_model_len": 32768}) is None
+
+
+def test_the_probe_reads_the_mock_both_ways(mock_server, monkeypatch):
+    from bench.server import probe_capabilities
+
+    caps = probe_capabilities(mock_server, "qwen3-8b")
+    assert caps == {"tools": True, "max_model_len": 16384}
+    monkeypatch.setenv("MOCK_AUTO_TOOL_CHOICE", "0")
+    assert probe_capabilities(mock_server, "qwen3-8b")["tools"] is False
