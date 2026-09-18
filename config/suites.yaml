@@ -85,6 +85,64 @@ suites:
     max_tokens: 16
     scorer: mc10
 
+  - id: mmlu_pro_cot
+    name: MMLU-Pro (10-way, chain-of-thought budget)
+    description: >-
+      Identical to `mmlu_pro` in every respect but one: max_tokens is 512
+      rather than 16. Same pinned dataset commit, same stratified draw, same
+      seed, same scorer, and the same baked-in "Do not explain." instruction.
+      Only the budget differs, which is what makes the pair interpretable.
+
+      It exists because a 16-token budget cannot measure a model that does not
+      obey that instruction. The Qwen3-4B DB Bahn SFT truncated 52.8% of its
+      replies and left 44.4% unparseable on `mmlu_pro`, against 1.2% and ~0 for
+      Qwen3-8B on the identical items -- it answers with genuine
+      chain-of-thought ("To find the overhead percent of prime cost, we need
+      to...") and runs out of budget mid-sentence. An accuracy over the
+      measurable minority is a lower bound on a subset biased toward whichever
+      items happened to be answerable in three tokens.
+
+      Two things this deliberately does NOT do. It does not relax the
+      instruction: refusing the requested format is a real property of the
+      model, it is what `unparseable_rate` is for, and rewriting the prompt
+      would hide the finding rather than measure it. And it does not edit
+      `mmlu_pro` -- a suite measured at two different caps is two different
+      suites, and mutating the existing id would silently invalidate every 8B
+      number already in the MLflow store while every future run still
+      succeeded.
+
+      Read alongside `mmlu_pro`, not instead of it: the 16-token cell measures
+      instruction-following, this one measures knowledge given that the model
+      ignores it. Scores here are NOT comparable with the 8B study's
+      `mmlu_pro` figures.
+    source: mmlu_pro
+    dataset: TIGER-Lab/MMLU-Pro
+    revision: b189ec765aa7ed75c8acfea42df31fdae71f97be
+    parquet: data/test-00000-of-00001.parquet
+    license: MIT
+    # 2048, set from measurement rather than by analogy with gsm8k.
+    #
+    # 512 was tried first and left 22.0% of dbbahn_bf16's replies truncated. A
+    # probe re-asked 15 of those items at 2048 against the same server: 8 of 15
+    # finished naturally, consuming 585-1276 tokens (median 1276), which says
+    # plainly that 512 was under-budget rather than that the model never stops.
+    # The remaining 7 were still going at 2048 -- not looping, but re-deriving
+    # and second-guessing ("Still not matching. Let's try..."). Projected
+    # truncation at this budget is therefore ~10%.
+    #
+    # ~10% is ABOVE the 5% at which the report flags a cell, and that is
+    # accepted deliberately: the probe shows the tail is a genuine
+    # non-termination property of this model on hard STEM items, not a budget
+    # artifact, and 4096 would cost double to reclaim a shrinking remainder.
+    # Accuracy from this suite is a LOWER BOUND and must be reported with the
+    # truncation rate beside it.
+    max_tokens: 2048
+    scorer: mc10
+    # Disabled so a default `bench.quality` run -- including every 8B config --
+    # is unchanged. `select_suites` honours an explicit --suites request
+    # regardless of this flag, which is how the 4B pass opts in.
+    enabled: false
+
   - id: gsm8k
     name: GSM8K (grade-school math, chain of thought)
     description: >-
@@ -102,3 +160,160 @@ suites:
     # with thinking off lands around 150-250 tokens on these.
     max_tokens: 512
     scorer: numeric
+
+  - id: ifeval
+    name: IFEval (verifiable instruction following)
+    description: >-
+      Prompts carrying constraints a program can check -- "at least 300 words",
+      "no commas", "wrap the whole reply in double quotes". No judge, no answer
+      key beyond the constraint itself, and generation-based, so unlike the
+      multiple-choice suites it has room to move under quantization.
+
+      250 of the published 541, stratified over the instruction each item leads
+      with. Stratified because the types are unevenly represented -- 66 items
+      carry `punctuation:no_comma`, 10 carry
+      `detectable_format:constrained_response` -- and a flat draw would
+      under-sample exactly the rarer constraints a degraded config drops first.
+
+      The verifiers are reimplemented in `bench.ifeval` rather than imported, so
+      the run path takes no harness dependency. Two deliberate deviations from
+      the original, both to keep a tokenizer model out of the run path: words
+      and sentences are counted by regex where the original uses nltk. Scores
+      here will therefore not match published IFEval numbers, which is the same
+      trade `mmlu` and `gsm8k` already make and is sound for the comparison this
+      study runs -- each config against its own BF16 reference on identical items.
+
+      Four numbers per config, as the original defines them: prompt-level and
+      instruction-level, strict and loose. `accuracy` is prompt-level strict --
+      every constraint on the item obeyed, exactly as the reply came back. The
+      gap between strict and loose is itself a signal: a config whose loose
+      score holds while its strict score falls has kept the capability and lost
+      the format.
+    source: ifeval
+    dataset: google/IFEval
+    revision: 966cd89545d6b6acfd7638bc708b98261ca58e84
+    parquet: ifeval_input_data.jsonl
+    license: Apache-2.0
+    # Generous. Items ask for 300+ word essays, and a constraint the model was
+    # cut off before satisfying is an unmeasured item rather than a failure --
+    # `truncated_rate` is what says so.
+    max_tokens: 1024
+    scorer: ifeval
+
+  - id: mmlu_de
+    name: MMLU-DE (professionally translated, item-matched to `mmlu`)
+    description: >-
+      The German half of the multilingual question. MMMLU is OpenAI's
+      professional translation of the same 14,042 MMLU test items in the same
+      row order, so the identical stratified draw selects the identical
+      questions: `mmlu-0007` and `mmlu_de-0007` are one question in two
+      languages. At 250 items that pairing is the difference between a readable
+      effect and noise, and a test asserts the two suites stay item-matched.
+
+      Professionally translated rather than machine-translated on purpose. The
+      Occiglot maintainers warn that their own German sets are machine
+      translated and sensitive to translation and prompt choices; that
+      sensitivity would sit inside any German-vs-English gap this study
+      reported.
+
+      One confound, accepted deliberately and stated here rather than buried:
+      the answer-format instruction is in German too, so `mmlu` and `mmlu_de`
+      differ in question language AND instruction language. An English
+      instruction would isolate content language, but it is not what an Atos
+      deployment serving German-market customers does -- and German
+      instruction-following is part of what degrades. A gap between the two
+      suites is therefore the two together.
+
+      Five of the 14,042 source items carry a gold letter that disagrees with
+      the English key, with options in the same order in both files. They are
+      left as the source has them. It costs the comparison nothing: every config
+      is scored against the same key, so a wrong label subtracts equally from
+      all of them and cancels in the paired metric.
+    source: mmlu_de
+    dataset: openai/MMMLU
+    revision: 325a01dc3e173cac1578df94120499aaca2e2504
+    parquet: test/mmlu_DE-DE.csv
+    license: MIT
+    max_tokens: 16
+    scorer: mc
+
+  - id: belebele_de
+    name: Belebele German (reading comprehension)
+    description: >-
+      The second German reading, and a different kind from `mmlu_de` on purpose.
+      Translated MMLU measures world knowledge, which a model can often answer
+      from English-learned facts whatever language the question is in. Belebele
+      supplies a German passage and asks a question answerable only by reading
+      it, so it is far harder to pass on English knowledge alone -- which is the
+      capability a German-language document or support deployment actually
+      needs, and the one the multilingual-degradation literature says goes
+      first.
+
+      Natively parallel across 122 language variants rather than machine
+      translated. Flat sample: the 900 items have no subject axis and are
+      already spread across their source passages.
+    source: belebele_de
+    dataset: facebook/belebele
+    revision: 7899cdfa4e1e0d733fd77c848e2c273cb1d32be2
+    parquet: data/deu_Latn.jsonl
+    license: CC-BY-SA-4.0
+    # Larger than the other MC suites: the prompt carries a full passage, but
+    # the reply is still one letter. Same tight budget, same reasoning -- a
+    # config needing more than this to name a letter has failed the instruction.
+    max_tokens: 16
+    scorer: mc
+
+  - id: bfcl_ast
+    name: BFCL single-turn (native function calling)
+    description: >-
+      Tool calling: the capability the wider study is actually about, and the
+      one an enterprise agent lives or dies by. Generation-based and structured,
+      so unlike multiple choice it has real room to move under quantization -- a
+      drop here is more malformed or wrong calls to an internal API, which is
+      more failed workflows falling back to a human.
+
+      250 items stratified over four single-turn categories: `simple_python`
+      (one function offered), `multiple` (several offered, one right),
+      `parallel` (several calls from one instruction), and `irrelevance` (the
+      offered functions cannot answer, so the right move is to call nothing).
+      Irrelevance is what makes this a tool-calling score rather than a
+      call-formatting score -- knowing when not to call is half of what makes an
+      agent deployable, and nothing else in the suite measures it.
+
+      Asked in NATIVE function-calling mode against the `tools` serve profile
+      (`--enable-auto-tool-choice --tool-call-parser hermes`), not by requesting
+      JSON in the prompt. Two reasons. The parser under test is then the one
+      that would actually be deployed; and BFCL applies no guided decoding, so
+      what is measured is the model's *unaided* ability to emit a well-formed
+      call. Under guided decoding that rate would be ~100% by construction and
+      the degradation signal would be masked -- which is the trap the
+      structured-output literature warns about.
+
+      Reported as two failure rates, not one accuracy. `structure_failure` is
+      nothing decodable coming back at all; `semantic_failure` is a well-formed
+      call that is wrong. They break an integration in different ways and
+      degrade at different rates, and a merged number hides which is happening.
+
+      The matcher is deterministic -- no judge -- and reimplemented in
+      `bench.bfcl`. Only the Python categories are drawn, so the published
+      matcher's Java and JavaScript type rules are deliberately absent rather
+      than present as untested code.
+    source: bfcl_ast
+    provenance: repository
+    dataset: ShishirPatil/gorilla
+    revision: 6ea57973c7a6097fd7c5915698c54c17c5b1b6c8
+    parquet: berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_simple_python.json
+    extra_sources:
+      - berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_multiple.json
+      - berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_parallel.json
+      - berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_irrelevance.json
+      - berkeley-function-call-leaderboard/bfcl_eval/data/possible_answer/BFCL_v4_simple_python.json
+      - berkeley-function-call-leaderboard/bfcl_eval/data/possible_answer/BFCL_v4_multiple.json
+      - berkeley-function-call-leaderboard/bfcl_eval/data/possible_answer/BFCL_v4_parallel.json
+    license: Apache-2.0
+    # A tool call is short. Generous enough that a model wrapping it in prose
+    # still gets the call out, tight enough that a runaway reply is counted as
+    # truncated rather than costing minutes an item.
+    max_tokens: 512
+    scorer: bfcl_ast
+    profile: tools

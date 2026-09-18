@@ -46,6 +46,14 @@ class RequestRecord:
     completion_tokens: int | None = None
     finish_reason: str | None = None
     output_text: str = ""
+    # Calls the server's tool-call parser decoded, assembled from the streamed
+    # fragments. Empty on every request that did not use native function
+    # calling -- and, importantly, also empty when the parser could NOT decode
+    # what the model emitted, which is the structure-failure signal BFCL splits
+    # its errors on. Each entry is {"name": str, "arguments": str}, arguments
+    # left as the raw JSON string the model produced so a scorer can see
+    # malformed JSON rather than a parse error here.
+    tool_calls: list[dict[str, str]] = field(default_factory=list)
     success: bool = False
     error: str | None = None
 
@@ -108,6 +116,32 @@ class LoadResult:
         return [r for r in self.records if r.success]
 
 
+def _accumulate_tool_calls(chunk: dict[str, Any], calls: dict[int, dict[str, str]]) -> None:
+    """Fold one streamed chunk's tool-call fragments into `calls`, keyed by index.
+
+    A tool call does not arrive whole. The name comes once, then `arguments`
+    streams in pieces across many chunks, and with parallel calls several
+    indices interleave. Concatenating everything into one string -- which is
+    what the timing path does, deliberately, because for TTFT any token will do
+    -- would splice two calls' arguments together and produce JSON that fails to
+    parse for a reason the model is not responsible for.
+    """
+    # `choices` is present but EMPTY on the final usage-only chunk, so this
+    # cannot index blindly -- doing so raised IndexError inside the request
+    # loop, where it was caught and reported as "no request succeeded".
+    choices = chunk.get("choices") or []
+    if not choices:
+        return
+    for delta_call in (choices[0].get("delta") or {}).get("tool_calls") or []:
+        index = delta_call.get("index", 0)
+        entry = calls.setdefault(index, {"name": "", "arguments": ""})
+        function = delta_call.get("function") or {}
+        if function.get("name"):
+            entry["name"] += function["name"]
+        if function.get("arguments"):
+            entry["arguments"] += function["arguments"]
+
+
 def _extract_delta(chunk: dict[str, Any]) -> tuple[str, bool]:
     """Return (text, is_content_bearing) for one streamed chunk.
 
@@ -139,6 +173,9 @@ async def _one_request(
     collect_output: bool,
 ) -> RequestRecord:
     pieces: list[str] = []
+    # Keyed by the index the server assigns each call, so parallel calls whose
+    # fragments interleave in the stream are reassembled separately.
+    tool_calls: dict[int, dict[str, str]] = {}
     last_token_at: float | None = None
     record.start_time = time.perf_counter()
 
@@ -162,6 +199,8 @@ async def _one_request(
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+
+                _accumulate_tool_calls(chunk, tool_calls)
 
                 if usage := chunk.get("usage"):
                     record.prompt_tokens = usage.get("prompt_tokens")
@@ -193,6 +232,9 @@ async def _one_request(
             record.completion_tokens = len(record.itls) + 1
 
         record.output_text = "".join(pieces)
+        # Ordered by the index the server assigned, which is the order the model
+        # emitted them. Parallel-call items are scored on that order.
+        record.tool_calls = [tool_calls[i] for i in sorted(tool_calls)]
         record.success = True
         return record
 

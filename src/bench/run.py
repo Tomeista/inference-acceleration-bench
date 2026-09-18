@@ -131,6 +131,22 @@ async def run_cell(
             file=sys.stderr,
         )
 
+    # check_prompt_lengths exists to catch a served chat template that differs
+    # from the one the prompt set was built against, which would make this
+    # config's prompts a different length from every other config's and quietly
+    # invalidate the comparison. Its verdict was being computed, merged into
+    # notes, and never shown to anyone.
+    if notes.get("prompt_length_checked") and not notes.get("prompt_length_ok", True):
+        print(
+            f"  warning: {cls.id} promised {notes.get('prompt_tokens_expected')} "
+            f"prompt tokens but the server saw "
+            f"{notes.get('prompt_tokens_observed_min')}-"
+            f"{notes.get('prompt_tokens_observed_max')}. The served chat template "
+            f"probably differs from the one prompts/ was built with, so this "
+            f"cell is not comparable with configs measured on the same set.",
+            file=sys.stderr,
+        )
+
     # A preempted sequence is evicted and recomputed, which inflates tail
     # latency for a reason that has nothing to do with the config under test.
     # It shows up first on a speculative server, where the draft model takes
@@ -273,7 +289,22 @@ async def main_async(args: argparse.Namespace) -> int:
                     }
                     with tracking.cell_run(run_name=cell_id, params=cell_params):
                         tracking.log_cell_results(
-                            values, notes, records, artifact_dir, cell_id
+                            values,
+                            notes,
+                            records,
+                            artifact_dir,
+                            cell_id,
+                            # A config with a draft model must produce acceptance
+                            # statistics. If it does not, the counter names have
+                            # moved -- which has happened between vLLM versions --
+                            # and the cell would otherwise look like a baseline
+                            # rather than like a speculative run that lost its
+                            # explanation.
+                            expected=(
+                                metrics_mod.SPEC_METRICS
+                                if cfg.spec_method != "none"
+                                else ()
+                            ),
                         )
 
     print("\nsummary")

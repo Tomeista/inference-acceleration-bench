@@ -15,15 +15,20 @@ from dataclasses import dataclass
 import pytest
 
 from bench.scoring import (
+    SCORERS,
     ItemResult,
+    ScoreResult,
+    TEXT_KEPT,
     aggregate,
     agreement,
     extract_mc,
     extract_mc10,
     extract_numeric,
     normalize_number,
+    register_scorer,
     repetition_ratio,
     score_records,
+    split_thinking,
     wilson_interval,
 )
 
@@ -130,6 +135,25 @@ def test_narrowing_the_fallback_does_not_cost_the_letter_outright():
     """Only the unlabelled form loses "I"; the instructed format keeps it."""
     assert extract_mc10("Answer: I") == "I"
     assert extract_mc10("The answer is (I).") == "I"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Answer: C\nExplanation: Option A is wrong.", "C"),
+        ("Answer: C because option B fails.", "C"),
+        ("The answer is D since E and F are wrong.", "D"),
+        ("**Answer: G**\n\nOptions H and J do not apply.", "G"),
+    ],
+)
+def test_a_labelled_answer_followed_by_prose_keeps_its_letter(text, expected):
+    """The labelled letter, not the last distractor the explanation names.
+
+    The narrowing above once looked across newlines, so a label followed by any
+    explanation was dropped and the bare fallback returned the explanation's
+    last letter -- a wrong option, scored as the model's answer.
+    """
+    assert extract_mc10(text) == expected
 
 
 # --------------------------------------------------------------------------
@@ -341,3 +365,209 @@ def test_no_reference_yields_no_metric_rather_than_zero():
     claim, where the truth is that BF16 has not been run yet.
     """
     assert agreement([_result("s0", "A")], {}) == {}
+
+
+# --------------------------------------------------------------------------
+# the general scorer contract
+# --------------------------------------------------------------------------
+
+
+def test_a_scorer_reaches_the_structured_part_of_its_key():
+    """The reason the contract takes a row rather than a gold string.
+
+    `mc`/`mc10`/`numeric` need only `answer`, which is why they fitted the
+    original shape. Everything the capability suite adds -- instruction specs,
+    acceptable-call sets, unit tests -- lives in `meta`, and a scorer that
+    could not see it would have to smuggle its gold data through a string.
+    """
+
+    def needs_meta(reply, key) -> ScoreResult:
+        return ScoreResult(
+            extracted=reply.text, correct=reply.text in key["meta"]["accept"]
+        )
+
+    register_scorer("needs_meta_probe", needs_meta)
+    try:
+        key = {"s0": {"answer": "x", "meta": {"accept": ["x", "y"]}}}
+        results = score_records([FakeRecord("s0", "y")], key, "needs_meta_probe")
+        assert results[0].correct
+        assert results[0].expected == "x"
+    finally:
+        SCORERS.pop("needs_meta_probe")
+
+
+def test_a_scorer_cannot_silently_replace_another():
+    """Two incomparable columns would end up in MLflow under one name."""
+    with pytest.raises(KeyError, match="already registered"):
+        register_scorer("mc", lambda reply, key: ScoreResult(None, False))
+
+
+def test_a_per_item_extra_aggregates_to_a_rate():
+    """0/1 per item, averaged, is the rate every failure-split metric wants."""
+    results = [
+        ItemResult("s0", "A", "A", True, "stop", False, 0.0, "", {"structure_failure": 1.0}),
+        ItemResult("s1", "A", "A", True, "stop", False, 0.0, "", {"structure_failure": 0.0}),
+        ItemResult("s2", "A", "A", True, "stop", False, 0.0, "", {"structure_failure": 0.0}),
+    ]
+    assert aggregate(results)["structure_failure"] == pytest.approx(1 / 3)
+
+
+def test_a_ratio_of_sums_is_not_a_mean_of_ratios():
+    """Why the _num/_den convention exists rather than averaging.
+
+    Two items: one instruction, satisfied; four instructions, none satisfied.
+    Averaging per-item ratios gives 0.5, which says the model followed half of
+    what it was told. It followed one instruction in five.
+    """
+    results = [
+        ItemResult("s0", "", None, True, "stop", False, 0.0, "",
+                   {"instruction_accuracy_num": 1.0, "instruction_accuracy_den": 1.0}),
+        ItemResult("s1", "", None, False, "stop", False, 0.0, "",
+                   {"instruction_accuracy_num": 0.0, "instruction_accuracy_den": 4.0}),
+    ]
+    assert aggregate(results)["instruction_accuracy"] == pytest.approx(0.2)
+
+
+def test_a_metric_no_item_carried_is_absent_rather_than_zero():
+    """The repo-wide convention. 0.0 would read as a measurement."""
+    results = [
+        ItemResult("s0", "", None, True, "stop", False, 0.0, "",
+                   {"partial_credit_num": 0.0, "partial_credit_den": 0.0}),
+    ]
+    assert "partial_credit" not in aggregate(results)
+
+
+def test_an_item_without_extras_writes_no_extras_field():
+    """Keeps the three original suites' items files byte-identical, and those
+    files are read back as the reference for the agreement join."""
+    row = ItemResult("s0", "A", "A", True, "stop", False, 0.0, "x").to_dict()
+    assert "extra" not in row
+
+
+# --------------------------------------------------------------------------
+# regression: the refactor must not have moved a single score
+# --------------------------------------------------------------------------
+
+
+def test_recorded_replies_still_score_the_way_they_were_scored(scored_items):
+    """Re-score real model output against what the run recorded at the time.
+
+    The generalized contract was meant to leave `mc`, `mc10` and `numeric`
+    scoring exactly what they scored before. Unit tests on hand-written strings
+    cannot prove that; these are the replies Qwen3-8B and Qwen3-4B actually
+    produced, already scored by the pre-refactor code, so a drift anywhere in
+    extraction shows up here as a mismatch.
+
+    Skipped when `results/` is absent -- it is gitignored machine state, so a
+    fresh clone has nothing to check against.
+    """
+    checked = 0
+    for scorer, key, rows in scored_items:
+        # Only replies that were not clipped at TEXT_KEPT can be re-scored:
+        # extraction is last-match-wins, so a clipped reply is a different
+        # string and would disagree for a reason that is not a regression.
+        usable = [r for r in rows if len(r["text"]) < TEXT_KEPT]
+        records = [FakeRecord(r["scenario_id"], r["text"], r["finish_reason"]) for r in usable]
+        for old, new in zip(usable, score_records(records, key, scorer)):
+            assert new.extracted == old["extracted"], f"{old['scenario_id']}: extraction moved"
+            assert new.correct == old["correct"], f"{old['scenario_id']}: verdict moved"
+            checked += 1
+
+    assert checked > 1000, f"only {checked} recorded replies were re-scored; too few to trust"
+
+
+# --------------------------------------------------------------------------
+# the thinking block
+# --------------------------------------------------------------------------
+
+
+def test_a_reply_without_a_think_block_is_untouched():
+    """Every non-thinking suite goes through this path, so it has to be exact."""
+    assert split_thinking("Answer: C") == ("", "Answer: C", False)
+
+
+def test_the_answer_is_what_follows_the_close_tag():
+    thinking, answer, unterminated = split_thinking(
+        "<think>Let me work it out. 2+2=4.</think>\n\nAnswer: B"
+    )
+    assert thinking == "Let me work it out. 2+2=4."
+    assert answer.strip() == "Answer: B"
+    assert not unterminated
+
+
+def test_a_template_opened_block_is_still_split():
+    """vLLM's chat template can emit `<think>` itself, so the model's own text
+    begins mid-thought and only the closing tag ever appears."""
+    thinking, answer, unterminated = split_thinking("reasoning here</think>Answer: A")
+    assert thinking == "reasoning here"
+    assert answer == "Answer: A"
+    assert not unterminated
+
+
+def test_a_thought_that_ran_out_of_budget_has_no_answer():
+    """The case the thinking arm exists to catch.
+
+    A truncated trace usually stops mid-derivation on a number or a letter. Were
+    the reasoning scored as the reply, a config that thought itself out of
+    budget would come out at chance -- a plausible accuracy -- instead of
+    unparseable, which is what actually happened.
+    """
+    thinking, answer, unterminated = split_thinking("<think>so the answer is C, but wait")
+    assert unterminated
+    assert answer == ""
+    assert extract_mc(answer) is None
+
+
+def test_a_second_think_tag_in_the_answer_is_content():
+    """Consuming it would silently delete part of the reply."""
+    _, answer, _ = split_thinking("<think>reasoning</think>I would <think> about it. Answer: D")
+    assert answer == "I would <think> about it. Answer: D"
+
+
+def test_a_truncated_thought_is_scored_unparseable_not_wrong():
+    records = [FakeRecord("s0", "<think>therefore B", finish_reason="length")]
+    results = score_records(records, {"s0": "B"}, "mc")
+    assert results[0].extracted is None
+    assert not results[0].correct
+    assert results[0].truncated
+    assert results[0].extra["thinking_unterminated"] == 1.0
+
+
+def test_thinking_cost_is_reported_in_exact_characters():
+    """Not tokens: the server reports completion_tokens for the whole reply and
+    does not split it at the close tag, so a per-part token count would be an
+    estimate sitting in a column of exact numbers."""
+    records = [FakeRecord("s0", "<think>" + "x" * 90 + "</think>" + "Answer: A")]
+    values = aggregate(score_records(records, {"s0": "A"}, "mc"))
+    assert values["thinking_chars"] == 90
+    assert values["answer_chars"] == len("Answer: A")
+    assert values["thinking_share"] == pytest.approx(90 / (90 + 9))
+    assert values["accuracy"] == 1.0
+
+
+def test_a_non_thinking_reply_reports_no_thinking_metrics():
+    """Absent rather than zero: a suite run with thinking off must not produce a
+    thinking_chars column of zeros that reads as a measurement."""
+    values = aggregate(score_records([FakeRecord("s0", "Answer: A")], {"s0": "A"}, "mc"))
+    assert "thinking_chars" not in values
+    assert "thinking_share" not in values
+
+
+def test_a_loop_inside_the_reasoning_still_counts_as_repetition():
+    """Scoring only the answer would hide the clearest sign of a damaged
+    checkpoint, which is a model stuck inside its own trace."""
+    loop = "the same clause over and over " * 20
+    records = [FakeRecord("s0", f"<think>{loop}</think>Answer: A")]
+    assert score_records(records, {"s0": "A"}, "mc")[0].repetition > 0.8
+
+
+def test_a_long_reply_keeps_its_end_where_the_answer_is():
+    from bench.scoring import TEXT_KEPT, clip_text
+
+    short = "x" * TEXT_KEPT
+    assert clip_text(short) == short
+    long = "start " + "y" * 5000 + " Answer: J"
+    clipped = clip_text(long)
+    assert clipped.startswith("start ")
+    assert clipped.endswith("Answer: J")
+    assert extract_mc10(clipped) == "J"

@@ -7,6 +7,7 @@ requests in parallel.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -167,3 +168,112 @@ async def test_aggregate_over_a_real_load(mock_server):
     assert values["output_tps"] > 0
     assert values["ttft_s_p95"] >= values["ttft_s_p50"]
     assert values["tpot_s_p50"] == pytest.approx(MOCK_ITL_S, abs=0.02)
+
+
+# --------------------------------------------------------------------------
+# native function calling
+# --------------------------------------------------------------------------
+
+
+async def test_a_streamed_tool_call_is_reassembled(mock_server, monkeypatch):
+    """The path BFCL depends on, and the only suite that exercises it.
+
+    Under `--enable-auto-tool-choice` a tool call never arrives as content. The
+    name comes in one chunk and the argument JSON streams in pieces, so a client
+    that only read `delta.content` would record an empty reply and the whole
+    BFCL cell would score as total structure failure -- a dramatic, entirely
+    false, finding about quantization destroying tool calling.
+    """
+    monkeypatch.setenv(
+        "MOCK_TOOL_CALLS",
+        json.dumps([{"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}]),
+    )
+    scenario = Scenario(
+        scenario_id="t0",
+        class_id="tools",
+        turns=[Turn(messages=[{"role": "user", "content": "weather?"}], max_tokens=32, temperature=0.0)],
+    )
+    result = await run_load(
+        [scenario], base_url=mock_server, model="qwen3-8b",
+        concurrency=1, num_requests=1, collect_output=True,
+    )
+    record = result.records[0]
+    assert record.success
+    assert record.tool_calls == [
+        {"name": "get_weather", "arguments": '{"city": "Paris", "days": 3}'}
+    ]
+    assert json.loads(record.tool_calls[0]["arguments"]) == {"city": "Paris", "days": 3}
+
+
+async def test_parallel_tool_calls_do_not_have_their_arguments_spliced(
+    mock_server, monkeypatch
+):
+    """Two calls stream interleaved, keyed by index.
+
+    Concatenating every fragment in arrival order -- which is what the timing
+    path does deliberately, because for TTFT any token will do -- would splice
+    the two argument blobs into one unparseable string. That would read as a
+    structure failure caused by the model rather than by the client.
+    """
+    monkeypatch.setenv(
+        "MOCK_TOOL_CALLS",
+        json.dumps([
+            {"name": "get_weather", "arguments": {"city": "Paris"}},
+            {"name": "get_weather", "arguments": {"city": "Berlin"}},
+        ]),
+    )
+    scenario = Scenario(
+        scenario_id="t1",
+        class_id="tools",
+        turns=[Turn(messages=[{"role": "user", "content": "weather?"}], max_tokens=64, temperature=0.0)],
+    )
+    result = await run_load(
+        [scenario], base_url=mock_server, model="qwen3-8b",
+        concurrency=1, num_requests=1, collect_output=True,
+    )
+    calls = result.records[0].tool_calls
+    assert len(calls) == 2
+    assert json.loads(calls[0]["arguments"]) == {"city": "Paris"}
+    assert json.loads(calls[1]["arguments"]) == {"city": "Berlin"}
+
+
+async def test_a_tool_call_still_counts_toward_ttft(mock_server, monkeypatch):
+    """A tool-call chunk carries no content but is still a generated token.
+
+    If it did not count, a tool-calling cell would report a TTFT equal to its
+    whole latency -- which is the behaviour the timing path was written to
+    avoid, and which the structured accumulator must not have regressed.
+    """
+    monkeypatch.setenv(
+        "MOCK_TOOL_CALLS", json.dumps([{"name": "ping", "arguments": {"x": 1}}])
+    )
+    scenario = Scenario(
+        scenario_id="t2",
+        class_id="tools",
+        turns=[Turn(messages=[{"role": "user", "content": "ping"}], max_tokens=16, temperature=0.0)],
+    )
+    result = await run_load(
+        [scenario], base_url=mock_server, model="qwen3-8b",
+        concurrency=1, num_requests=1, collect_output=True,
+    )
+    record = result.records[0]
+    assert record.ttft is not None
+    assert record.ttft < record.latency
+
+
+async def test_an_ordinary_reply_records_no_tool_calls(mock_server, monkeypatch):
+    """Absent rather than empty-but-present: every non-tool suite goes through
+    the same client, and a stray call there would be a bug worth seeing."""
+    monkeypatch.delenv("MOCK_TOOL_CALLS", raising=False)
+    monkeypatch.setenv("MOCK_REPLY", "Answer: C")
+    scenario = Scenario(
+        scenario_id="t3",
+        class_id="chat",
+        turns=[Turn(messages=[{"role": "user", "content": "q"}], max_tokens=16, temperature=0.0)],
+    )
+    result = await run_load(
+        [scenario], base_url=mock_server, model="qwen3-8b",
+        concurrency=1, num_requests=1, collect_output=True,
+    )
+    assert result.records[0].tool_calls == []
+    assert result.records[0].output_text == "Answer: C"

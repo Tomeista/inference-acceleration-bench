@@ -56,6 +56,23 @@ def scripted_reply() -> str | None:
     return os.environ.get("MOCK_REPLY")
 
 
+def scripted_tool_calls() -> list[dict] | None:
+    """Tool calls to stream instead of content, or None.
+
+    `MOCK_TOOL_CALLS` holds a JSON list of {"name": ..., "arguments": {...}}.
+    Set, the mock behaves the way vLLM does under `--enable-auto-tool-choice`:
+    the reply carries NO content at all and the call arrives in `delta.tool_calls`
+    instead, with its arguments split across chunks.
+
+    That split is the point. A tool call does not arrive whole -- the name comes
+    once and the argument JSON streams in pieces, interleaved across indices
+    when there are several calls -- and reassembling it is the part of the client
+    that BFCL depends on and that no other suite exercises.
+    """
+    raw = os.environ.get("MOCK_TOOL_CALLS")
+    return json.loads(raw) if raw else None
+
+
 _state = {
     "in_flight": 0,
     "prompt_tokens": 0.0,
@@ -86,7 +103,10 @@ async def version() -> JSONResponse:
 
 @app.get("/v1/models")
 async def models() -> JSONResponse:
-    return JSONResponse({"data": [{"id": MODEL_NAME, "object": "model"}]})
+    max_model_len = int(os.environ.get("MOCK_MAX_MODEL_LEN", "16384"))
+    return JSONResponse(
+        {"data": [{"id": MODEL_NAME, "object": "model", "max_model_len": max_model_len}]}
+    )
 
 
 @app.get("/metrics")
@@ -141,6 +161,22 @@ async def chat_completions(request: Request):
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
     prompt_tokens = _estimate_prompt_tokens(messages, tools)
 
+    # vLLM refuses `tool_choice: "auto"` unless it was started with
+    # --enable-auto-tool-choice, which is how bench.server.probe_capabilities
+    # tells the `tools` profile apart. MOCK_AUTO_TOOL_CHOICE=0 plays a base
+    # server. Read per request, like MOCK_REPLY.
+    if tools and body.get("tool_choice") == "auto":
+        if os.environ.get("MOCK_AUTO_TOOL_CHOICE", "1") != "1":
+            return JSONResponse(
+                {"error": '"auto" tool choice requires --enable-auto-tool-choice'},
+                status_code=400,
+            )
+        if not body.get("stream"):
+            return JSONResponse(
+                {"choices": [{"index": 0, "message": {"role": "assistant", "content": ""},
+                              "finish_reason": "length"}]}
+            )
+
     # Filler always runs to max_tokens and finishes on length: ignore_eos is
     # what the speed sweep relies on for a fixed output length. A scripted
     # reply instead stops where it ends, one "token" per word, which is what
@@ -176,10 +212,38 @@ async def chat_completions(request: Request):
             await asyncio.sleep(TTFT_MS / 1000.0 * factor)
             yield _chunk(request_id, created, model, {"role": "assistant", "content": ""})
 
-            for i, piece in enumerate(pieces):
-                if i:
-                    await asyncio.sleep(ITL_MS / 1000.0 * factor)
-                yield _chunk(request_id, created, model, {"content": piece})
+            calls = scripted_tool_calls()
+            if calls is not None:
+                # Names first, then argument fragments round-robin across the
+                # calls, so the indices interleave exactly as a real parallel
+                # tool call does.
+                for index, call in enumerate(calls):
+                    yield _chunk(
+                        request_id, created, model,
+                        {"tool_calls": [{
+                            "index": index,
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": ""},
+                        }]},
+                    )
+                encoded = [json.dumps(c["arguments"]) for c in calls]
+                for offset in range(max((len(e) for e in encoded), default=0)):
+                    for index, blob in enumerate(encoded):
+                        if offset < len(blob):
+                            await asyncio.sleep(ITL_MS / 1000.0 * factor)
+                            yield _chunk(
+                                request_id, created, model,
+                                {"tool_calls": [{
+                                    "index": index,
+                                    "function": {"arguments": blob[offset]},
+                                }]},
+                            )
+            else:
+                for i, piece in enumerate(pieces):
+                    if i:
+                        await asyncio.sleep(ITL_MS / 1000.0 * factor)
+                    yield _chunk(request_id, created, model, {"content": piece})
 
             yield _chunk(request_id, created, model, {}, finish=finish)
 

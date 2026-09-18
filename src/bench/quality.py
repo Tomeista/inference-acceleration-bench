@@ -44,6 +44,8 @@ from bench.server import (
     ServerConfig,
     check_context_budget,
     load_configs,
+    probe_capabilities,
+    profile_problem,
     server_info,
     wait_for_ready,
 )
@@ -128,6 +130,36 @@ def read_reference(path: Path) -> dict[str, str | None]:
     return reference
 
 
+def reference_mismatch(suite: Suite, cfg: ServerConfig, args: argparse.Namespace) -> str | None:
+    """Why the reference answers for `suite` cannot be joined against `cfg`, or None.
+
+    The join is keyed on scenario_id alone, and the suites are global, so a
+    reference produced by a *different model* matches at full overlap: no
+    missing items, no stale-manifest warning, and an agreement_with_reference
+    that silently means "how often these two unrelated models agree" instead
+    of "what compression cost this one".
+
+    served_model_name is the right discriminator, not model_path: compression
+    variants of one model deliberately have different paths but share a served
+    name, while two model families share neither. Needs only the files on
+    disk, so it runs before a single request is spent.
+    """
+    out_path = items_path(suite.id, cfg.id, args.suffix)
+    reference_path = items_path(suite.id, args.reference)
+    if reference_path == out_path or not read_reference(reference_path):
+        return None
+    recorded_model = read_meta(reference_path).get("served_model_name")
+    if recorded_model is None or recorded_model == cfg.served_model_name:
+        return None
+    return (
+        f"the reference answers in {reference_path.name} ({suite.id}) were "
+        f"produced by served model {recorded_model!r}, but {cfg.id!r} serves "
+        f"{cfg.served_model_name!r}. These are different models, so agreement "
+        f"between them is not a quantization-damage metric. Pass "
+        f"--reference <a config serving {cfg.served_model_name}>."
+    )
+
+
 def _manifest_digest() -> str:
     """Tie a run to the exact eval sets it scored, as run.py does for prompts."""
     if not MANIFEST_PATH.exists():
@@ -164,6 +196,12 @@ async def run_suite(
     args: argparse.Namespace,
 ) -> tuple[dict, dict, list[ItemResult]]:
     """Score one suite against one config."""
+    # Before any request: a wrong reference used to be discovered only after
+    # the whole suite had been generated, and the pass was then thrown away.
+    if problem := reference_mismatch(suite, cfg, args):
+        print(f"  refusing to score: {problem}", file=sys.stderr)
+        raise SystemExit(2)
+
     scenarios, answers = load_suite(suite, verify=not args.no_verify)
     if args.n_items:
         # Smoke-test escape hatch. Never for a real measurement: two configs
@@ -239,6 +277,11 @@ async def run_suite(
         results,
         {
             "config_id": cfg.id,
+            # Which model produced these answers, so the next config to join
+            # against them can tell whether that join means anything. config_id
+            # alone cannot: it is the thing the caller already chose.
+            "served_model_name": cfg.served_model_name,
+            "model_path": cfg.model_path,
             "suite_id": suite.id,
             "concurrency": args.concurrency,
             "suffix": args.suffix,
@@ -251,6 +294,13 @@ async def run_suite(
     notes = {
         "finish_reasons": sorted({r.finish_reason or "none" for r in results}),
         "reference": args.reference,
+        # Whether this cell was *supposed* to produce a paired agreement -- it is
+        # every config but the reference itself. Distinct from
+        # `reference_available`, which says whether it actually did: the gap
+        # between the two is a reference run that is missing or has drifted, and
+        # without recording the intent an absent agreement column is
+        # indistinguishable from a cell that never needed one.
+        "agreement_expected": reference_path != out_path,
         "reference_available": "agreement_with_reference" in values,
         "reference_stale": stale_reference,
         # Repo-relative when it sits under the repo, absolute otherwise: the
@@ -380,12 +430,31 @@ async def main_async(args: argparse.Namespace) -> int:
         return 2
 
     base_url = args.server_url or cfg.base_url
-    suites = select_suites([s.strip() for s in args.suites.split(",") if s.strip()])
+    requested = [s.strip() for s in args.suites.split(",") if s.strip()]
+    suites = select_suites(requested)
+
+    # A config lists the serve profiles it is scored under, and a suite runs
+    # only on configs that list its profile. That is what keeps bfcl_ast to the
+    # four core configs: the others have no `tools` server by design.
+    outside = [s.id for s in suites if s.profile not in cfg.profiles]
+    if outside:
+        if requested:
+            print(
+                f"cannot run {', '.join(outside)} on {cfg.id}: it needs a serve "
+                f"profile {cfg.id} does not list ({cfg.profiles}) in config/configs.yaml",
+                file=sys.stderr,
+            )
+            return 2
+        suites = [s for s in suites if s.id not in outside]
+        print(f"not scored on {cfg.id} by design: {', '.join(outside)}", file=sys.stderr)
 
     for suite in suites:
         if problem := check_context_budget(
             cfg, args.concurrency, PROMPT_BUDGET + suite.max_tokens
         ):
+            print(f"cannot run {suite.id}: {problem}", file=sys.stderr)
+            return 2
+        if problem := reference_mismatch(suite, cfg, args):
             print(f"cannot run {suite.id}: {problem}", file=sys.stderr)
             return 2
 
@@ -416,6 +485,30 @@ async def main_async(args: argparse.Namespace) -> int:
             f"may not be the one this config describes.",
             file=sys.stderr,
         )
+
+    # Each suite names the serve profile it needs, and a server started from
+    # the wrong script still answers -- every BFCL request would come back 400
+    # from a base server, leaving an empty cell. Asked of the server itself,
+    # since nothing else knows which script started it.
+    caps = probe_capabilities(base_url, cfg.served_model_name)
+    unservable = {
+        s.id: p for s in suites if (p := profile_problem(s.profile, caps))
+    }
+    if unservable:
+        for suite_id, problem in unservable.items():
+            print(f"cannot run {suite_id} on this server: {problem}", file=sys.stderr)
+        if requested:
+            return 2
+        # A default selection spans profiles, and no one server covers them
+        # all, so the suites this server cannot run are skipped by name.
+        suites = [s for s in suites if s.id not in unservable]
+        print(
+            f"skipping {', '.join(unservable)}: not requested by name, and this "
+            f"server cannot run them. Score them from the matching serve script.",
+            file=sys.stderr,
+        )
+        if not suites:
+            return 2
 
     if args.preflight:
         print("\npreflight ...")
@@ -476,6 +569,15 @@ async def main_async(args: argparse.Namespace) -> int:
                         [r.to_dict() for r in results],
                         artifact_dir,
                         cell_id,
+                        # Every config but the reference is meant to carry a
+                        # paired agreement. Its absence means the reference run
+                        # is missing or scored different bytes, which is a
+                        # broken comparison rather than a cell with less to say.
+                        expected=(
+                            ("agreement_with_reference",)
+                            if notes.get("agreement_expected")
+                            else ()
+                        ),
                     )
 
     print("\nsummary")
